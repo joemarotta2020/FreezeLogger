@@ -1,0 +1,59 @@
+name: Build WorkerSpinLockFix diagnostics
+
+on:
+  push:
+    branches:
+      - sitea-forensics
+    paths:
+      - "skyrim-freeze-fix/**"
+      - ".github/workflows/build-workerspinlockfix.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: skyrim-freeze-fix
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure environment
+        run: |
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          cmake --version
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" version
+
+      - name: Configure
+        run: cmake --preset windows-x64-release
+
+      - name: Build
+        run: cmake --build --preset windows-x64-release -- /m
+
+      - name: Collect artifacts
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE "artifact"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          $dll = Get-ChildItem -Path "C:\sk\wslf\r" -Recurse -Filter "WorkerSpinLockFix.dll" | Select-Object -First 1
+          $pdb = Get-ChildItem -Path "C:\sk\wslf\r" -Recurse -Filter "WorkerSpinLockFix.pdb" | Select-Object -First 1
+
+          if (-not $dll) { throw "WorkerSpinLockFix.dll not found" }
+          if (-not $pdb) { throw "WorkerSpinLockFix.pdb not found" }
+
+          Copy-Item $dll.FullName (Join-Path $out "WorkerSpinLockFix.dll")
+          Copy-Item $pdb.FullName (Join-Path $out "WorkerSpinLockFix.pdb")
+          Copy-Item "dist\SKSE\Plugins\WorkerSpinLockFix.toml" (Join-Path $out "WorkerSpinLockFix.toml")
+
+          Get-FileHash (Join-Path $out "WorkerSpinLockFix.dll") -Algorithm SHA256
+          Get-ChildItem $out | Format-Table Name,Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WorkerSpinLockFix-sitea-forensics
+          path: artifact/*
+          if-no-files-found: error
