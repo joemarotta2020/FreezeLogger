@@ -53,8 +53,11 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
     // completion ack the join would have raised, which is what the case-study
     // 29 §6 capture needs validated -- hence this module ships detect-only by
     // default until a field capture (FreezeLogger v0.9.0's render-side probe)
-    // confirms the release path. This module never suspends an engine thread
-    // or reads thread contexts.
+    // confirms the release path. Production detection/recovery never suspends
+    // an engine thread. In the JM diagnostic build, when diagnostic_logging is
+    // enabled AND the stuck signature has already been confirmed, the watchdog
+    // briefly suspends threads one-at-a-time to capture register/stack evidence,
+    // then immediately resumes them before continuing recovery.
     //
     // Returns true if armed (render-task anchor resolved + id 34557 wrap
     // installed + watchdog started). Best-effort: any failure leaves the
