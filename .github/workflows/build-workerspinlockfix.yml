@@ -46,7 +46,7 @@ jobs:
 
           Copy-Item $dll.FullName (Join-Path $out "WorkerSpinLockFix.dll")
           Copy-Item $pdb.FullName (Join-Path $out "WorkerSpinLockFix.pdb")
-          Copy-Item "dist\SKSE\Plugins\WorkerSpinLockFix.toml" (Join-Path $out "WorkerSpinLockFix.toml")
+          Copy-Item "dist\WorkerSpinLockFix.toml" (Join-Path $out "WorkerSpinLockFix.toml")
 
           Get-FileHash (Join-Path $out "WorkerSpinLockFix.dll") -Algorithm SHA256
           Get-ChildItem $out | Format-Table Name,Length
