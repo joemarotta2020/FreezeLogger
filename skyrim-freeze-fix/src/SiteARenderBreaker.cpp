@@ -85,6 +85,33 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
             return info.EventState ? 1 : 0;
         }
 
+        // ----- SEH-guarded Singleton-A snapshot ----------------------------
+        // POD-only so the noexcept SEH frame holds no objects with
+        // destructors. On any fault, ok stays false and the watchdog stands
+        // down (never act on memory we could not read). Reads from the
+        // singleton instance captured at episode entry.
+        struct SiteASnap {
+            bool           ok;
+            std::uintptr_t ack;
+            std::uintptr_t wake;
+            std::uint32_t  workid;
+        };
+
+        SiteASnap ReadSiteA(std::uintptr_t a_singleton) noexcept {
+            SiteASnap s{};
+            if (a_singleton == 0) return s;  // ok == false
+            __try {
+                s.wake   = *reinterpret_cast<volatile std::uintptr_t*>(a_singleton + kOffWake);
+                s.ack    = *reinterpret_cast<volatile std::uintptr_t*>(a_singleton + kOffAck);
+                s.workid = *reinterpret_cast<volatile std::uint32_t*>(a_singleton + kOffWorkId);
+                s.ok = true;
+                return s;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                s.ok = false;
+                return s;
+            }
+        }
+
         // ----- stuck-episode forensics --------------------------------------
         // Diagnostic-only. These helpers run only AFTER the normal dwell +
         // zero-progress gate has proven a Site-A render join is stuck, and
@@ -410,33 +437,6 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
                     "[SiteARenderBreaker.forensics] POST+250ms episode {}: "
                     "render context unavailable (tid={})",
                     a_seq, renderTid);
-            }
-        }
-
-        // ----- SEH-guarded Singleton-A snapshot ----------------------------
-        // POD-only so the noexcept SEH frame holds no objects with
-        // destructors. On any fault, ok stays false and the watchdog stands
-        // down (never act on memory we could not read). Reads from the
-        // singleton instance captured at episode entry.
-        struct SiteASnap {
-            bool           ok;
-            std::uintptr_t ack;
-            std::uintptr_t wake;
-            std::uint32_t  workid;
-        };
-
-        SiteASnap ReadSiteA(std::uintptr_t a_singleton) noexcept {
-            SiteASnap s{};
-            if (a_singleton == 0) return s;  // ok == false
-            __try {
-                s.wake   = *reinterpret_cast<volatile std::uintptr_t*>(a_singleton + kOffWake);
-                s.ack    = *reinterpret_cast<volatile std::uintptr_t*>(a_singleton + kOffAck);
-                s.workid = *reinterpret_cast<volatile std::uint32_t*>(a_singleton + kOffWorkId);
-                s.ok = true;
-                return s;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                s.ok = false;
-                return s;
             }
         }
 
