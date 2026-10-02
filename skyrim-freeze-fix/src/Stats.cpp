@@ -22,6 +22,7 @@ namespace WorkerSpinLockFix::Stats {
         // SiteARenderBreaker
         std::atomic<std::uint64_t> g_sar_stuck{ 0 };
         std::atomic<std::uint64_t> g_sar_released{ 0 };
+        std::atomic<std::uint64_t> g_sar_release_failed{ 0 };
 
         // LeakedSpinLockBreaker
         std::atomic<std::uint64_t> g_lsb_stuck{ 0 };
@@ -36,7 +37,7 @@ namespace WorkerSpinLockFix::Stats {
                 "stats: phase4: queued={} drained={} passthrough={} | "
                 "job_wait: stuck={} released={} | "
                 "site_a: stuck={} released={} | "
-                "site_a_render: stuck={} released={} | "
+                "site_a_render: stuck={} released={} failed={} | "
                 "leaked_lock: stuck={} released={}",
                 g_p4_queued.load(std::memory_order_relaxed),
                 g_p4_drained.load(std::memory_order_relaxed),
@@ -47,6 +48,7 @@ namespace WorkerSpinLockFix::Stats {
                 g_sa_released.load(std::memory_order_relaxed),
                 g_sar_stuck.load(std::memory_order_relaxed),
                 g_sar_released.load(std::memory_order_relaxed),
+                g_sar_release_failed.load(std::memory_order_relaxed),
                 g_lsb_stuck.load(std::memory_order_relaxed),
                 g_lsb_released.load(std::memory_order_relaxed));
         }
@@ -92,6 +94,9 @@ namespace WorkerSpinLockFix::Stats {
     }
     void OnSiteARenderReleased() noexcept {
         g_sar_released.fetch_add(1, std::memory_order_relaxed);
+    }
+    void OnSiteARenderReleaseFailed() noexcept {
+        g_sar_release_failed.fetch_add(1, std::memory_order_relaxed);
     }
 
     void OnLeakedLockStuck() noexcept {

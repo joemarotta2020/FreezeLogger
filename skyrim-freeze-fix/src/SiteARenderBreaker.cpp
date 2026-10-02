@@ -325,6 +325,71 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
             }
         }
 
+        void LogEventHandleCandidates(
+            std::string_view a_phase, const ThreadForensicSnap& a_s)
+        {
+            if (!a_s.ok) return;
+
+            struct Candidate {
+                const char* name;
+                std::uintptr_t value;
+            };
+            const std::array<Candidate, 7> regs{{
+                { "RBX", a_s.rbx }, { "RSI", a_s.rsi },
+                { "RDI", a_s.rdi }, { "R12", a_s.r12 },
+                { "R13", a_s.r13 }, { "R14", a_s.r14 },
+                { "R15", a_s.r15 }
+            }};
+
+            std::array<std::uintptr_t, 128> seen{};
+            std::size_t seenCount = 0;
+            const auto logCandidate = [&](std::string_view a_name,
+                                          std::uintptr_t a_value) {
+                if (a_value == 0) return;
+                for (std::size_t i = 0; i < seenCount; ++i) {
+                    if (seen[i] == a_value) return;
+                }
+                if (seenCount < seen.size()) {
+                    seen[seenCount++] = a_value;
+                }
+
+                const int state = QueryEventState(a_value);
+                if (state >= 0) {
+                    logs::warn(
+                        "[SiteARenderBreaker.forensics] {} event-handle "
+                        "candidate {}=0x{:x} state={}",
+                        a_phase, a_name, a_value, state);
+                }
+            };
+
+            for (const auto& c : regs) {
+                logCandidate(c.name, c.value);
+            }
+
+            for (std::size_t i = 0; i < a_s.stackWordCount; ++i) {
+                const auto value = a_s.stackWords[i];
+                const int state = QueryEventState(value);
+                if (state < 0) continue;
+
+                bool duplicate = false;
+                for (std::size_t j = 0; j < seenCount; ++j) {
+                    if (seen[j] == value) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) continue;
+                if (seenCount < seen.size()) {
+                    seen[seenCount++] = value;
+                }
+
+                logs::warn(
+                    "[SiteARenderBreaker.forensics] {} event-handle "
+                    "candidate stack+0x{:x}=0x{:x} state={}",
+                    a_phase, i * sizeof(std::uintptr_t), value, state);
+            }
+        }
+
         void DumpAllThreadForensics(DWORD a_renderTid) {
             const HANDLE snap =
                 ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -411,6 +476,7 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
             ThreadForensicSnap render{};
             if (CaptureThreadForensics(renderTid, render)) {
                 LogThreadForensics("PRE/render-focus", render, true);
+                LogEventHandleCandidates("PRE/render-focus", render);
                 LogPointerWindow("render.RBX", render.rbx);
                 LogPointerWindow("render.RSI", render.rsi);
                 LogPointerWindow("render.RDI", render.rdi);
@@ -431,10 +497,11 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
                 g_worker_tid.load(std::memory_order_relaxed);
             ThreadForensicSnap render{};
             if (CaptureThreadForensics(renderTid, render)) {
-                LogThreadForensics("POST+250ms/render", render, true);
+                LogThreadForensics("POST+verify/render", render, true);
+                LogEventHandleCandidates("POST+verify/render", render);
             } else {
                 logs::warn(
-                    "[SiteARenderBreaker.forensics] POST+250ms episode {}: "
+                    "[SiteARenderBreaker.forensics] POST+verify episode {}: "
                     "render context unavailable (tid={})",
                     a_seq, renderTid);
             }
@@ -600,18 +667,74 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
                     continue;
                 }
 
-                ::SetEvent(h);
-                Stats::OnSiteARenderReleased();
+                const BOOL setOk = ::SetEvent(h);
+                if (!setOk) {
+                    Stats::OnSiteARenderReleaseFailed();
+                    logs::error(
+                        "[SiteARenderBreaker] RECOVERY FAILED: SetEvent(0x{:x}) "
+                        "returned false (GetLastError={}); render thread remains "
+                        "parked in id 34557 episode {}.",
+                        reinterpret_cast<std::uintptr_t>(h),
+                        ::GetLastError(), seq);
+                    if (g_diag) {
+                        DumpPostRecoveryRender(seq);
+                    }
+                    continue;
+                }
+
                 logs::warn(
-                    "[SiteARenderBreaker] STUCK render-side Site-A join "
-                    "RELEASED: the render worker was parked in id 34557 for "
-                    "{} ms (work-id={}) with no sub-task completing; delivered "
-                    "the missing worker-ack via SetEvent(0x{:x}) so the waiter "
-                    "resumes.",
-                    dwell, s2.workid, reinterpret_cast<std::uintptr_t>(h));
+                    "[SiteARenderBreaker] recovery attempt: signaled "
+                    "Singleton-A worker-ack 0x{:x} after {} ms parked "
+                    "(work-id={}, episode={}); verifying that id 34557 "
+                    "actually returns before counting a release.",
+                    reinterpret_cast<std::uintptr_t>(h),
+                    dwell, s2.workid, seq);
+
+                // The 2026-10-02 field capture proved that SetEvent() can
+                // succeed while id 34557 remains blocked on a deeper
+                // per-sub-task event.  The detour clears g_in_wait only when
+                // the original id 34557 function really returns, so verify
+                // actual forward progress instead of equating API success
+                // with recovery.
+                constexpr std::uint32_t kVerifyMs = 500;
+                constexpr std::uint32_t kVerifyStepMs = 25;
+                bool exited = false;
+                for (std::uint32_t waited = 0;
+                     waited < kVerifyMs &&
+                     g_running.load(std::memory_order_relaxed);
+                     waited += kVerifyStepMs)
+                {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(kVerifyStepMs));
+                    if (!g_in_wait.load(std::memory_order_acquire) ||
+                        g_episode_seq.load(std::memory_order_relaxed) != seq)
+                    {
+                        exited = true;
+                        break;
+                    }
+                }
+
+                if (exited) {
+                    Stats::OnSiteARenderReleased();
+                    logs::warn(
+                        "[SiteARenderBreaker] VERIFIED RELEASE: id 34557 "
+                        "returned after signaling worker-ack 0x{:x} "
+                        "(episode={}).",
+                        reinterpret_cast<std::uintptr_t>(h), seq);
+                } else {
+                    Stats::OnSiteARenderReleaseFailed();
+                    const auto ackNow = QueryEventState(ackEntry);
+                    logs::error(
+                        "[SiteARenderBreaker] RECOVERY FAILED: SetEvent(0x{:x}) "
+                        "succeeded but id 34557 is STILL PARKED after {} ms "
+                        "(episode={}, work-id={}, ack-state={}). The render "
+                        "thread is waiting on a deeper sub-task condition; "
+                        "do not count this as a release.",
+                        reinterpret_cast<std::uintptr_t>(h), kVerifyMs,
+                        seq, s2.workid, ackNow);
+                }
 
                 if (g_diag) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
                     DumpPostRecoveryRender(seq);
                 }
             }

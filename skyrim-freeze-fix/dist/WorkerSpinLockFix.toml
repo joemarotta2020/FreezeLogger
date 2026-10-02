@@ -57,7 +57,7 @@ enabled = true
 # depth. Volume is high during gameplay (hundreds of lines per second)
 # but spdlog buffers writes asynchronously, so the in-game cost is low.
 # Recommended ON for the first AE sessions. Default: false.
-diagnostic_logging = false
+diagnostic_logging = true
 
 [job_wait_breaker]
 # Layer 2: recovery for the Skyrim main-thread WaitForJobTask
@@ -116,8 +116,10 @@ poll_interval_ms = 1000
 # make the breaker more conservative.
 recheck_window_ms = 1500
 
-# Verbose per-decision logging for the watchdog. Default: false.
-diagnostic_logging = false
+# Verbose per-decision logging for the watchdog. Enabled on this
+# sitea-forensics branch so the next stuck episode captures the deeper
+# wait-handle evidence.
+diagnostic_logging = true
 
 [leaked_spinlock_breaker]
 # Layer 5: recovery for the LEAKED BSSpinLock hard-freeze (the fifth
@@ -186,7 +188,7 @@ poll_interval_ms = 1000
 recheck_window_ms = 1500
 
 # Verbose per-decision logging for the watchdog. Default: false.
-diagnostic_logging = false
+diagnostic_logging = true
 
 [site_a_breaker]
 # Layer 3: recovery for the Skyrim main-thread Site-A worker-ack
@@ -245,7 +247,7 @@ poll_interval_ms = 1000
 recheck_window_ms = 1500
 
 # Verbose per-decision logging for the watchdog. Default: false.
-diagnostic_logging = false
+diagnostic_logging = true
 
 [site_a_render_breaker]
 # Layer 4: recovery for the RENDER-side Site-A worker-ack join (the
@@ -281,13 +283,12 @@ enabled = true
 # when) a real render-side Site-A worker-ack deadlock occurs, without
 # altering any wait.
 #
-# Set to false to ACTIVELY recover: the watchdog delivers the missing
-# completion signal (SetEvent on the captured worker-ack handle) so the
-# render thread resumes. The worker is provably not progressing when
-# this fires, so waking the render thread is equivalent to the ack that
-# was lost (worst case a one-frame cosmetic cloth glitch vs a permanent
-# freeze).
-detect_only = true
+# Set to false to ACTIVELY ATTEMPT recovery. Field capture on 2026-10-02
+# proved that signaling Singleton-A's worker-ack can succeed while id 34557
+# remains parked on a deeper per-sub-task wait. v2.6.2 therefore verifies
+# that id 34557 actually returns before counting a release, and logs a failed
+# recovery plus event-handle candidates when it does not.
+detect_only = false
 
 # How long the render thread must be parked in id 34557 before the
 # module treats it as a candidate stall (milliseconds). Far above any
@@ -306,4 +307,4 @@ poll_interval_ms = 1000
 recheck_window_ms = 1500
 
 # Verbose per-decision logging for the watchdog. Default: false.
-diagnostic_logging = false
+diagnostic_logging = true

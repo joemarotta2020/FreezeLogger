@@ -35,8 +35,10 @@ namespace WorkerSpinLockFix::Stats {
     // thread parked in id 34557 past the dwell threshold with zero
     // progress, worker-ack never signaled).
     void OnSiteARenderStuck() noexcept;
-    // Active mode delivered the missing worker-ack (SetEvent).
+    // Active mode delivered the missing worker-ack and id 34557 actually returned.
     void OnSiteARenderReleased() noexcept;
+    // Recovery was attempted but id 34557 remained parked, or SetEvent failed.
+    void OnSiteARenderReleaseFailed() noexcept;
 
     // ---- LeakedSpinLockBreaker (leaked BSSpinLock recovery) -----------
     // The leaked-lock signature was confirmed (a BSSpinLock held unchanged
