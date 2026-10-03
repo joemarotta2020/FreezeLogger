@@ -507,6 +507,237 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
             }
         }
 
+        // Field evidence from the 2026-10-02 v2.6.2 capture proved that
+        // id 34557 does NOT block on Singleton-A's worker-ack.  While the
+        // render thread is inside KERNELBASE/ntdll's WaitForSingleObjectEx,
+        // the actual per-sub-task event HANDLE is preserved in both RDI and
+        // R14; the return address on the stack points back inside id 34557.
+        //
+        // Active recovery therefore targets that deepest completion event,
+        // not the outer worker-ack.  This is deliberately SE-1.5.97-only
+        // until the same register/return-address shape is field-validated on
+        // AE.  Every candidate must be a real, currently-unsignaled event and
+        // must be observed while the same id-34557 episode is still active.
+        bool IsInsideRenderTaskJoin(const ThreadForensicSnap& a_s) noexcept {
+            if (!a_s.ok) return false;
+
+            const auto& a = SkyrimAnchors::Get();
+            constexpr std::uintptr_t kRenderTaskSpan = 0xED;  // SE id34557 body
+
+            for (std::size_t i = 0; i < a_s.stackWordCount; ++i) {
+                const auto ret = a_s.stackWords[i];
+                if (ret >= a.renderTaskFn &&
+                    ret < (a.renderTaskFn + kRenderTaskSpan))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool TryRecoverDeepSubtaskWait(
+            std::uint64_t a_seq,
+            std::uintptr_t a_ackEntry)
+        {
+            if (REL::Module::GetRuntime() != REL::Module::Runtime::SE) {
+                logs::warn(
+                    "[SiteARenderBreaker] deeper per-sub-task recovery is "
+                    "field-validated only on SE 1.5.97; refusing the deep "
+                    "SetEvent path on this runtime.");
+                return false;
+            }
+
+            constexpr std::uint32_t kMaxSignals = 4;
+            constexpr std::uint32_t kVerifyMs = 500;
+            constexpr std::uint32_t kVerifyStepMs = 25;
+
+            std::array<std::uintptr_t, kMaxSignals> signaled{};
+            std::uint32_t signaledCount = 0;
+
+            for (std::uint32_t attempt = 0; attempt < kMaxSignals; ++attempt) {
+                if (!g_in_wait.load(std::memory_order_acquire) ||
+                    g_episode_seq.load(std::memory_order_relaxed) != a_seq)
+                {
+                    return true;
+                }
+
+                const DWORD renderTid =
+                    g_worker_tid.load(std::memory_order_relaxed);
+                ThreadForensicSnap render{};
+                if (!CaptureThreadForensics(renderTid, render)) {
+                    logs::error(
+                        "[SiteARenderBreaker] DEEP RECOVERY ABORTED: could "
+                        "not capture render-thread context (episode={}).",
+                        a_seq);
+                    return false;
+                }
+
+                if (!IsInsideRenderTaskJoin(render)) {
+                    logs::error(
+                        "[SiteARenderBreaker] DEEP RECOVERY ABORTED: render "
+                        "thread no longer has a return frame inside id 34557 "
+                        "while episode {} is still marked active.", a_seq);
+                    return false;
+                }
+
+                const auto deepHandle = render.rdi;
+
+                // In the field capture RDI and R14 independently preserved the
+                // same live event HANDLE through the ntdll wait path. Requiring
+                // both registers to agree makes this recovery fail closed if
+                // the calling convention / wait implementation ever changes.
+                if (deepHandle == 0 || render.r14 != deepHandle) {
+                    logs::error(
+                        "[SiteARenderBreaker] DEEP RECOVERY ABORTED: no "
+                        "stable wait HANDLE in RDI/R14 (RDI=0x{:x}, "
+                        "R14=0x{:x}, episode={}).",
+                        render.rdi, render.r14, a_seq);
+                    return false;
+                }
+
+                const auto singleton =
+                    g_episode_singleton.load(std::memory_order_relaxed);
+                const auto ss = ReadSiteA(singleton);
+                if (deepHandle == a_ackEntry ||
+                    (ss.ok && deepHandle == ss.wake))
+                {
+                    logs::error(
+                        "[SiteARenderBreaker] DEEP RECOVERY ABORTED: "
+                        "candidate 0x{:x} aliases a Singleton-A protocol "
+                        "event (ack/wake), not a per-sub-task completion "
+                        "event (episode={}).",
+                        deepHandle, a_seq);
+                    return false;
+                }
+
+                const int deepState = QueryEventState(deepHandle);
+                if (deepState != 0) {
+                    logs::error(
+                        "[SiteARenderBreaker] DEEP RECOVERY ABORTED: "
+                        "candidate 0x{:x} is not a valid unsignaled event "
+                        "(state={}, episode={}).",
+                        deepHandle, deepState, a_seq);
+                    return false;
+                }
+
+                for (std::uint32_t i = 0; i < signaledCount; ++i) {
+                    if (signaled[i] == deepHandle) {
+                        logs::error(
+                            "[SiteARenderBreaker] DEEP RECOVERY FAILED: "
+                            "render thread returned to the same unsignaled "
+                            "sub-task event 0x{:x} after it was already "
+                            "signaled (episode={}).",
+                            deepHandle, a_seq);
+                        return false;
+                    }
+                }
+
+                logs::warn(
+                    "[SiteARenderBreaker] DEEP RECOVERY attempt {}/{}: "
+                    "render is parked inside id 34557 on actual sub-task "
+                    "event 0x{:x} (RDI==R14, state=0); signaling that event "
+                    "instead of the outer worker-ack (episode={}).",
+                    attempt + 1, kMaxSignals, deepHandle, a_seq);
+
+                const HANDLE h = reinterpret_cast<HANDLE>(deepHandle);
+                if (!::SetEvent(h)) {
+                    logs::error(
+                        "[SiteARenderBreaker] DEEP RECOVERY FAILED: "
+                        "SetEvent(0x{:x}) returned false (GetLastError={}, "
+                        "episode={}).",
+                        deepHandle, ::GetLastError(), a_seq);
+                    return false;
+                }
+                signaled[signaledCount++] = deepHandle;
+
+                // Verify real forward progress.  id 34557 clears g_in_wait
+                // only when the original function returns.  If it advances to
+                // another per-sub-task wait, RDI/R14 will change and the next
+                // bounded iteration may release that one too.
+                for (std::uint32_t waited = 0;
+                     waited < kVerifyMs &&
+                     g_running.load(std::memory_order_relaxed);
+                     waited += kVerifyStepMs)
+                {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(kVerifyStepMs));
+                    if (!g_in_wait.load(std::memory_order_acquire) ||
+                        g_episode_seq.load(std::memory_order_relaxed) != a_seq)
+                    {
+                        logs::warn(
+                            "[SiteARenderBreaker] VERIFIED DEEP RELEASE: "
+                            "id 34557 returned after signaling sub-task "
+                            "event 0x{:x} (episode={}).",
+                            deepHandle, a_seq);
+                        return true;
+                    }
+                }
+
+                ThreadForensicSnap after{};
+                if (!CaptureThreadForensics(renderTid, after)) {
+                    logs::error(
+                        "[SiteARenderBreaker] DEEP RECOVERY FAILED: render "
+                        "thread remained in episode {} and post-signal "
+                        "context could not be captured.", a_seq);
+                    return false;
+                }
+
+                if (!IsInsideRenderTaskJoin(after)) {
+                    // It left the wait but has not yet unwound out of the
+                    // wrapped function. Give it one short grace window before
+                    // declaring failure.
+                    for (std::uint32_t waited = 0;
+                         waited < 250 &&
+                         g_running.load(std::memory_order_relaxed);
+                         waited += kVerifyStepMs)
+                    {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(kVerifyStepMs));
+                        if (!g_in_wait.load(std::memory_order_acquire) ||
+                            g_episode_seq.load(std::memory_order_relaxed) != a_seq)
+                        {
+                            logs::warn(
+                                "[SiteARenderBreaker] VERIFIED DEEP RELEASE: "
+                                "id 34557 unwound after signaling sub-task "
+                                "event 0x{:x} (episode={}).",
+                                deepHandle, a_seq);
+                            return true;
+                        }
+                    }
+
+                    logs::error(
+                        "[SiteARenderBreaker] DEEP RECOVERY FAILED: episode "
+                        "{} is still active but render is no longer parked "
+                        "at the recognized id-34557 wait site; refusing "
+                        "further forced signals.", a_seq);
+                    return false;
+                }
+
+                if (after.rdi == deepHandle) {
+                    logs::error(
+                        "[SiteARenderBreaker] DEEP RECOVERY FAILED: "
+                        "SetEvent(0x{:x}) did not move the render thread to "
+                        "a different sub-task wait within {} ms "
+                        "(episode={}).",
+                        deepHandle, kVerifyMs, a_seq);
+                    return false;
+                }
+
+                logs::warn(
+                    "[SiteARenderBreaker] deep signal 0x{:x} advanced the "
+                    "render join to another wait candidate RDI=0x{:x}; "
+                    "continuing bounded recovery (episode={}).",
+                    deepHandle, after.rdi, a_seq);
+            }
+
+            logs::error(
+                "[SiteARenderBreaker] DEEP RECOVERY FAILED: reached the "
+                "bounded limit of {} sub-task signals while id 34557 "
+                "episode {} remained active.",
+                kMaxSignals, a_seq);
+            return false;
+        }
+
         // ----- id 34557 wrap ------------------------------------------------
         std::uintptr_t __fastcall Detour_RenderTask(
             std::uintptr_t a1, std::uintptr_t a2,
@@ -657,81 +888,27 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
                     continue;
                 }
 
-                const auto h = reinterpret_cast<HANDLE>(ackEntry);
-                if (h == nullptr) {
-                    logs::warn(
-                        "[SiteARenderBreaker] STUCK render-side Site-A join "
-                        "confirmed ({} ms) but the worker-ack handle was not "
-                        "captured; cannot release this episode.",
-                        dwell);
-                    continue;
-                }
+                // v2.6.2 field evidence established the real wait chain:
+                // the render thread is blocked on a per-sub-task completion
+                // event INSIDE id 34557.  Signaling Singleton-A's outer
+                // worker-ack does not wake this wait and can publish completion
+                // too early.  v2.6.3 therefore targets the actual live wait
+                // HANDLE captured from the render thread (RDI==R14) and lets
+                // id 34557 / id 34567 complete the normal ack path themselves.
+                const bool released =
+                    TryRecoverDeepSubtaskWait(seq, ackEntry);
 
-                const BOOL setOk = ::SetEvent(h);
-                if (!setOk) {
-                    Stats::OnSiteARenderReleaseFailed();
-                    logs::error(
-                        "[SiteARenderBreaker] RECOVERY FAILED: SetEvent(0x{:x}) "
-                        "returned false (GetLastError={}); render thread remains "
-                        "parked in id 34557 episode {}.",
-                        reinterpret_cast<std::uintptr_t>(h),
-                        ::GetLastError(), seq);
-                    if (g_diag) {
-                        DumpPostRecoveryRender(seq);
-                    }
-                    continue;
-                }
-
-                logs::warn(
-                    "[SiteARenderBreaker] recovery attempt: signaled "
-                    "Singleton-A worker-ack 0x{:x} after {} ms parked "
-                    "(work-id={}, episode={}); verifying that id 34557 "
-                    "actually returns before counting a release.",
-                    reinterpret_cast<std::uintptr_t>(h),
-                    dwell, s2.workid, seq);
-
-                // The 2026-10-02 field capture proved that SetEvent() can
-                // succeed while id 34557 remains blocked on a deeper
-                // per-sub-task event.  The detour clears g_in_wait only when
-                // the original id 34557 function really returns, so verify
-                // actual forward progress instead of equating API success
-                // with recovery.
-                constexpr std::uint32_t kVerifyMs = 500;
-                constexpr std::uint32_t kVerifyStepMs = 25;
-                bool exited = false;
-                for (std::uint32_t waited = 0;
-                     waited < kVerifyMs &&
-                     g_running.load(std::memory_order_relaxed);
-                     waited += kVerifyStepMs)
-                {
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(kVerifyStepMs));
-                    if (!g_in_wait.load(std::memory_order_acquire) ||
-                        g_episode_seq.load(std::memory_order_relaxed) != seq)
-                    {
-                        exited = true;
-                        break;
-                    }
-                }
-
-                if (exited) {
+                if (released) {
                     Stats::OnSiteARenderReleased();
-                    logs::warn(
-                        "[SiteARenderBreaker] VERIFIED RELEASE: id 34557 "
-                        "returned after signaling worker-ack 0x{:x} "
-                        "(episode={}).",
-                        reinterpret_cast<std::uintptr_t>(h), seq);
                 } else {
                     Stats::OnSiteARenderReleaseFailed();
-                    const auto ackNow = QueryEventState(ackEntry);
                     logs::error(
-                        "[SiteARenderBreaker] RECOVERY FAILED: SetEvent(0x{:x}) "
-                        "succeeded but id 34557 is STILL PARKED after {} ms "
-                        "(episode={}, work-id={}, ack-state={}). The render "
-                        "thread is waiting on a deeper sub-task condition; "
-                        "do not count this as a release.",
-                        reinterpret_cast<std::uintptr_t>(h), kVerifyMs,
-                        seq, s2.workid, ackNow);
+                        "[SiteARenderBreaker] RECOVERY FAILED: the confirmed "
+                        "render-side Site-A episode {} remained stuck after "
+                        "bounded deep sub-task recovery (work-id={}, "
+                        "outer-ack=0x{:x}, outer-ack-state={}).",
+                        seq, s2.workid, ackEntry,
+                        QueryEventState(ackEntry));
                 }
 
                 if (g_diag) {
