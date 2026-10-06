@@ -50,4 +50,29 @@ namespace WorkerSpinLockFix::RecoveryPolicy {
         return signals_already_sent < max_signals && elapsed_ms < max_recovery_ms;
     }
 
+    // Compile-time regression tests for the progress gate. These make the
+    // safety contract part of every WorkerSpinLockFix build.
+    namespace tests {
+        constexpr DeepProgress before{ true, 7, 1, 0x100, 0x200 };
+
+        static_assert(Evaluate(
+            before, { true, 7, 1, 0x100, 0x201 }, false) == Decision::Continue);
+        static_assert(Evaluate(
+            before, { true, 7, 1, 0x100, 0x200 }, false) == Decision::AbortNoProgress);
+        static_assert(Evaluate(
+            before, { true, 7, 1, 0x100, 0x201 }, true) == Decision::AbortRepeatedHandle);
+        static_assert(Evaluate(
+            before, { false, 7, 1, 0x100, 0x200 }, false) == Decision::Complete);
+        static_assert(Evaluate(
+            before, { true, 8, 1, 0x100, 0x200 }, false) == Decision::Complete);
+        static_assert(Evaluate(
+            before, { true, 7, 2, 0x100, 0x201 }, false) == Decision::AbortProtocolChanged);
+        static_assert(Evaluate(
+            before, { true, 7, 1, 0x101, 0x201 }, false) == Decision::AbortProtocolChanged);
+
+        static_assert(WithinBudget(4, 2000, 12, 6000));
+        static_assert(!WithinBudget(12, 2000, 12, 6000));
+        static_assert(!WithinBudget(4, 6000, 12, 6000));
+    }
+
 }
