@@ -1,310 +1,57 @@
-# WorkerSpinLockFix - default configuration.
-#
-# This file is read once at SKSEPlugin_Load. Changes require a game
-# restart to take effect.
-#
-# The plugin lives in `Data/SKSE/Plugins/WorkerSpinLockFix.dll`. This
-# config file should be installed alongside the DLL at the same path
-# but with the .toml extension.
-#
-# The plugin fixes five independent Skyrim hard-freeze classes:
-#   * Layer 1 - Phase4Defer:   prevents the AB-BA BSSpinLock inversion
-#                              in the worker dispatcher.
-#   * Layer 2 - JobWaitBreaker: recovers the main thread from the
-#                              WaitForJobTask lost-wakeup hang.
-#   * Layer 3 - SiteABreaker:   recovers the main thread from the
-#                              Site-A (id 34554) worker-ack deadlock.
-#   * Layer 4 - SiteARenderBreaker: recovers the render thread from the
-#                              render-side Site-A (id 34557/34567)
-#                              per-task worker-ack join.
-#   * Layer 5 - LeakedSpinLockBreaker: force-releases a leaked BSSpinLock
-#                              (id 12210) that an idle worker (id 68058)
-#                              acquired and never released.
+# WorkerSpinLockFix v2.6.4 - field diagnostic/recovery profile
+# Read once at SKSEPlugin_Load; restart Skyrim after changing this file.
 
 [plugin]
-# Master kill-switch. If false, the plugin loads but installs nothing.
-# Use this to A/B test without rebuilding or removing the DLL.
 enabled = true
 
 [log]
-# How often the plugin emits a one-line counter dump (Phase4Defer +
-# JobWaitBreaker + SiteABreaker + SiteARenderBreaker counters). 0
-# disables the periodic dump.
 stats_interval_s = 60
 
 [phase4_defer]
-# Layer 1: the structural fix that prevents the engine's AB-BA spinlock
-# inversion. One inline wrap on the LockA acquirer (id 19369) plus two
-# surgical call-site patches inside the cycle hub (id 36016+0xdcb ->
-# id 40334, id 19372+0x606 -> id 40333) defer LockB acquires whenever
-# the current thread holds LockA. Deferred calls drain on the same
-# thread immediately after the LockA acquirer returns, so per-thread
-# call ordering is preserved and the AB-BA cycle simply cannot form.
-# The function entries of id 40333 / id 40334 are left pristine, so
-# other mods that hook those functions continue to work.
-#
-# See docs/case-study/22-v2-phase4-1-cycle-hub-characterisation.md for
-# the design and correctness audit, and docs/case-study/25 for the
-# call-site-patch refactor.
-#
-# Default: true. Set to false to disable the AB-BA prevention without
-# rebuilding or removing the DLL.
 enabled = true
+diagnostic_logging = false
 
-# Per-call diagnostic logging for Phase4Defer. Each entry into the
-# LockA wrap and each entry into the two LockB gates emits a log line
-# with the arguments, the captured return value, and the deferred-queue
-# depth. Volume is high during gameplay (hundreds of lines per second)
-# but spdlog buffers writes asynchronously, so the in-game cost is low.
-# Recommended ON for the first AE sessions. Default: false.
-diagnostic_logging = true
-
+# The 2026-10-06 capture field-validated the exact stalled-intact signature:
+# main remained in WaitForJobTask with zero progress for >7 s. v2.6.4 makes
+# this path active and verifies that the wrapped wait actually returns after
+# SetEvent before recording a successful recovery.
 [job_wait_breaker]
-# Layer 2: recovery for the Skyrim main-thread WaitForJobTask
-# lost-wakeup hang (the second freeze class, documented in
-# docs/case-study/27 and docs/case-study/28). Main::Update parks in
-# WaitForJobTask on a manual-reset job-completion event; under heavy
-# parallelism a producer can tear down the job queue AFTER main is
-# asleep WITHOUT signalling the event, leaving main waiting forever.
-#
-# This module wraps WaitForJobTask (located by a version-independent
-# .text body signature) to track when main is parked and on which job
-# index, then a watchdog thread detects a stuck job-wait and recovers
-# the engine. A job-wait is judged stuck when main has been parked past
-# `dwell_threshold_ms` AND the job entry it is waiting on makes ZERO
-# progress across `recheck_window_ms` -- either the chain has been torn
-# down to null (the producer cleared the queue after main parked), or
-# the entry's bytes are byte-for-byte identical (an orphaned job that
-# no thread is advancing). Both shapes have been observed in the field
-# (freeze_2026-06-15_160413 = torn-down; freeze_2026-06-15_204830 =
-# stalled-intact). A genuinely long but progressing job mutates its
-# counters within the window and is left alone.
-
-# Master switch for the module.
 enabled = true
-
-# Detect-only (DEFAULT). When the lost-wakeup signature is seen, the
-# module LOGS it but does NOT change engine behaviour. This is the safe
-# observation mode shipped while the release path is field-validated:
-# it confirms the module fires exactly when (and only when) a real
-# lost-wakeup occurs, without altering any wait.
-#
-# Set to false to ACTIVELY recover: the watchdog delivers the missing
-# completion signal (SetEvent on the parked job handle) so the main
-# thread resumes. The job is already gone when this fires, so waking
-# main is equivalent to the signal that was lost (worst case a
-# one-frame glitch vs a permanent freeze). The wait handle is derived
-# from the job-pool chain at wait entry, inside the WaitForJobTask wrap
-# that detect-only already installs, so active mode adds no extra hooks.
-detect_only = true
-
-# How long the main thread must be parked in WaitForJobTask before the
-# module treats it as a candidate stall (milliseconds). Far above any
-# legitimate job-wait during play, well below FreezeLogger's 15 s freeze
-# watchdog.
-dwell_threshold_ms = 5000
-
-# Watchdog poll cadence (milliseconds).
-poll_interval_ms = 1000
-
-# Zero-progress confirmation window (milliseconds). After the dwell
-# threshold is reached the watchdog snapshots the job entry, waits this
-# long, and re-samples; it only acts if the job made NO progress across
-# the window (chain still null, or entry bytes byte-for-byte identical).
-# This is the main safety knob: a long-but-progressing job mutates its
-# counters within the window and is left alone, so raise this value to
-# make the breaker more conservative.
-recheck_window_ms = 1500
-
-# Verbose per-decision logging for the watchdog. Enabled on this
-# sitea-forensics branch so the next stuck episode captures the deeper
-# wait-handle evidence.
-diagnostic_logging = true
-
-[leaked_spinlock_breaker]
-# Layer 5: recovery for the LEAKED BSSpinLock hard-freeze (the fifth
-# freeze class, documented in case-study 30 and proven by FreezeLogger
-# v0.11.1's parked-holder steady-state probe in
-# freeze_2026-06-25_222116). A thread (main, reached via Faster
-# HDT-SMP's cloth chain id 35565 -> BSSpinLock::Acquire id 12210) spins
-# forever on a heap BSSpinLock whose [+0] owner field names a DIFFERENT
-# thread -- an idle worker parked in the engine's worker pool (id 68058,
-# waiting on the pool Semaphore) that acquired the lock on an earlier
-# task, returned to the top of its loop, and went idle WITHOUT releasing
-# it. The unlock leaked, so this is a lock-ownership deadlock, NOT a lost
-# wakeup: no SetEvent (Layers 2-4) can break it -- the field logs show
-# those layers firing detect-only while the game still froze. The only
-# thing that can unblock the victim is force-releasing the leaked lock.
-#
-# This module installs NO inline hook (there is no single function to
-# wrap). A watchdog thread periodically suspends and inspects every
-# thread, looking for one contending a BSSpinLock at a version-
-# independent spin-retry signature, then follows that lock's owner. It
-# acts ONLY when the owner is provably parked in a kernel wait and the
-# lock's (owner,state) word plus the holder's instruction pointer have
-# stayed byte-for-byte UNCHANGED across the full dwell + recheck window
-# -- the steady-state proof that the lock is leaked and will never be
-# released by its holder.
-
-# Master switch for the module.
-enabled = true
-
-# Detect-only (DEFAULT). When the leaked-lock signature is seen, the
-# module LOGS it but does NOT change engine state. This is the safe
-# observation mode shipped while the force-release path is field-
-# validated: it confirms the module fires exactly when (and only when) a
-# real leaked-lock freeze occurs.
-#
-# Set to false to ACTIVELY recover: the watchdog force-releases the
-# leaked lock via an interlocked compare-exchange that clears it to 0
-# ONLY if it still holds exactly the proven-leaked (owner,state) word, so
-# it can never clobber a lock that changed in the last instant.
-#
-# FIELD BEHAVIOUR (v2.6.0): active mode does NOT fix the underlying leak
-# producer. If the engine keeps leaking locks (e.g. a specific actor's
-# HDT-SMP cloth path), the session enters a STUTTER LOOP — stuck for
-# ~dwell+recheck seconds, briefly runs, stuck again — instead of a
-# permanent hard-freeze. That is often enough to move the camera, leave
-# the area, or identify a content trigger. Removing the trigger stops
-# recurrence. See docs/case-study/30-leaked-spinlock-breaker.md.
-detect_only = true
-
-# How long the lock must be held UNCHANGED by a parked owner before the
-# module treats it as leaked (milliseconds). Far above any legitimate
-# spinlock hold (microseconds), well below FreezeLogger's 15 s freeze
-# watchdog.
-dwell_threshold_ms = 5000
-
-# Watchdog poll cadence (milliseconds). Each poll suspends and inspects
-# every thread once to look for a thread contending a BSSpinLock, so keep
-# this at or above ~1000 ms.
-poll_interval_ms = 1000
-
-# Steady-state confirmation window (milliseconds). After the dwell
-# threshold the watchdog pauses this long and re-proves the leak (owner
-# still parked at the same instruction, lock word unchanged) before
-# acting. Any movement stands it down, so raise this value to make the
-# breaker more conservative.
-recheck_window_ms = 1500
-
-# Verbose per-decision logging for the watchdog. Default: false.
-diagnostic_logging = true
-
-[site_a_breaker]
-# Layer 3: recovery for the Skyrim main-thread Site-A worker-ack
-# deadlock (the third freeze class, documented in
-# docs/case-study/29-siteabreaker-plan.md). Main::Update has a SECOND
-# infinite-wait site -- the id 34554 helper, reached via id 35565 and
-# driven by Faster HDT-SMP's per-frame parallel-cloth dispatch. The
-# caller publishes work into Singleton-A (sets pending=1, wakes a worker
-# via the auto-reset worker-wake event), then blocks INFINITE on the
-# manual-reset worker-ack event until the worker signals completion.
-# When a worker consumes the wake, takes the job, and never signals the
-# ack, main sleeps forever. Observed on HDT-SMP 3.1.0.0 AND 3.2.0.0
-# (freeze_2026-06-16_133223 and _152328), so it is independent of the
-# HDT-SMP version -- downgrading HDT-SMP does NOT fix it.
-#
-# This module wraps id 34554 (located by a version-independent .text
-# body signature, with the Singleton-A slot derived from its rip-relative
-# load) to mark when main entered a Site-A wait and capture the worker-ack
-# HANDLE at entry; a watchdog thread confirms the deadlock and recovers
-# the engine. The wait is judged stuck when main has been parked in the
-# SAME Site-A episode past `dwell_threshold_ms` AND is still parked after
-# `recheck_window_ms` (zero progress: pending still 1, work-id + ack
-# handle unchanged, ack event still NOT signaled). A Site-A wait that is
-# going to complete clears pending well inside the window and is left
-# alone.
-
-# Master switch for the module.
-enabled = true
-
-# Detect-only (DEFAULT). When the deadlock signature is seen, the module
-# LOGS it but does NOT change engine behaviour. This is the safe
-# observation mode shipped while the release path is field-validated: it
-# confirms the module fires exactly when (and only when) a real Site-A
-# worker-ack deadlock occurs.
-#
-# Set to false to ACTIVELY recover: the watchdog delivers the missing
-# completion signal (SetEvent on the captured worker-ack handle) so the
-# main thread resumes. The worker is provably not progressing when this
-# fires, so waking main is equivalent to the ack that was lost (worst
-# case a one-frame cosmetic cloth glitch vs a permanent freeze).
-detect_only = true
-
-# How long the main thread must be parked in id 34554 before the module
-# treats it as a candidate stall (milliseconds). Far above any legitimate
-# Site-A wait during play, well below FreezeLogger's 15 s freeze watchdog.
-dwell_threshold_ms = 5000
-
-# Watchdog poll cadence (milliseconds).
-poll_interval_ms = 1000
-
-# Zero-progress confirmation window (milliseconds). After the dwell
-# threshold the watchdog samples Singleton-A, waits this long, and
-# re-samples; it only acts if main stayed in the SAME Site-A episode
-# (still parked, pending=1, work-id + ack handle unchanged) across the
-# window. Raise this value to make the breaker more conservative.
-recheck_window_ms = 1500
-
-# Verbose per-decision logging for the watchdog. Default: false.
-diagnostic_logging = true
-
-[site_a_render_breaker]
-# Layer 4: recovery for the RENDER-side Site-A worker-ack join (the
-# fourth freeze class, documented in
-# docs/case-study/29-siteabreaker-plan.md and design.md 3.9, first
-# observed in freeze_2026-06-24_053440). The render thread runs a
-# per-frame dispatch loop (id 34567) driven by Faster HDT-SMP's
-# parallel-cloth work. For each task the loop calls a per-task join
-# helper (id 34557) that receives the SAME Singleton-A instance as the
-# main-side Site-A in rcx, publishes the task, and blocks INFINITE on
-# the manual-reset worker-ack event (Singleton-A +0x60) until the worker
-# signals completion. When a worker consumes the wake, takes the job,
-# and never signals the ack, the render thread sleeps forever -- the
-# render-thread analogue of the main-side Site-A deadlock.
-#
-# This module wraps id 34557 (located by a version-independent prologue
-# signature) to mark when the render thread entered a join and capture
-# the worker-ack HANDLE from the Singleton-A in rcx at entry; a watchdog
-# thread confirms the deadlock and recovers the engine. The wait is
-# judged stuck when the render thread has been parked in the SAME
-# episode past `dwell_threshold_ms` AND is still parked after
-# `recheck_window_ms` (zero progress: same singleton + work-id + ack
-# handle, ack event still NOT signaled). A join that is going to
-# complete clears well inside the window and is left alone.
-
-# Master switch for the module.
-enabled = true
-
-# Detect-only (DEFAULT). When the deadlock signature is seen, the module
-# LOGS it but does NOT change engine behaviour. This is the safe
-# observation mode shipped while the render-side release path is
-# field-validated: it confirms the module fires exactly when (and only
-# when) a real render-side Site-A worker-ack deadlock occurs, without
-# altering any wait.
-#
-# Set to false to ACTIVELY ATTEMPT recovery. Field capture on 2026-10-02
-# proved that signaling Singleton-A's worker-ack can succeed while id 34557
-# remains parked on a deeper per-sub-task wait. v2.6.2 therefore verifies
-# that id 34557 actually returns before counting a release, and logs a failed
-# recovery plus event-handle candidates when it does not.
 detect_only = false
-
-# How long the render thread must be parked in id 34557 before the
-# module treats it as a candidate stall (milliseconds). Far above any
-# legitimate join during play, well below FreezeLogger's 15 s freeze
-# watchdog.
 dwell_threshold_ms = 5000
-
-# Watchdog poll cadence (milliseconds).
 poll_interval_ms = 1000
-
-# Zero-progress confirmation window (milliseconds). After the dwell
-# threshold the watchdog samples the episode, waits this long, and
-# re-samples; it only acts if the render thread stayed in the SAME
-# episode (still parked, same singleton + work-id + ack handle) across
-# the window. Raise this value to make the breaker more conservative.
 recheck_window_ms = 1500
-
-# Verbose per-decision logging for the watchdog. Default: false.
 diagnostic_logging = true
+
+# Keep the older main-side Site-A path observational until a matching episode
+# is captured with the current diagnostics.
+[site_a_breaker]
+enabled = true
+detect_only = true
+dwell_threshold_ms = 5000
+poll_interval_ms = 1000
+recheck_window_ms = 1500
+diagnostic_logging = true
+
+# Active SE 1.5.97 deep recovery. The old four-signal cap is replaced by a
+# dual budget (12 signals / 6000 ms) but continuation is allowed ONLY when the
+# previous signal demonstrably advances id 34557 to a new unsignaled event
+# while episode, work-id and outer ack remain unchanged. Repeats, no-progress,
+# protocol mutation, invalid handles, or budget exhaustion abort recovery.
+[site_a_render_breaker]
+enabled = true
+detect_only = false
+dwell_threshold_ms = 5000
+poll_interval_ms = 1000
+recheck_window_ms = 1500
+diagnostic_logging = true
+
+# Leave force-release detect-only. This is a different failure class and the
+# 2026-10-06 episode was a job/join chain stall, not a proven leaked lock.
+[leaked_spinlock_breaker]
+enabled = true
+detect_only = true
+dwell_threshold_ms = 5000
+poll_interval_ms = 1000
+recheck_window_ms = 1500
+diagnostic_logging = false
