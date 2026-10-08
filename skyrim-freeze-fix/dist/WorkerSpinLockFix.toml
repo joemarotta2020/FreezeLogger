@@ -1,4 +1,4 @@
-# WorkerSpinLockFix v2.6.5 - field diagnostic/recovery profile
+# WorkerSpinLockFix v2.6.6 - field diagnostic/recovery profile
 # Read once at SKSEPlugin_Load; restart Skyrim after changing this file.
 
 [plugin]
@@ -59,3 +59,7 @@ dwell_threshold_ms = 5000
 poll_interval_ms = 1000
 recheck_window_ms = 1500
 diagnostic_logging = false
+
+# v2.6.6: after a verified bounded deep chain reaches work-id 0 with no remaining
+# deep event, revalidate the same id-34557 episode for 1s before signaling the
+# unchanged unsignaled outer worker-ack. Any protocol change still aborts.

@@ -20,6 +20,7 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
         constexpr std::uint32_t kVerifyMs = 500;
         constexpr std::uint32_t kVerifyStepMs = 25;
         constexpr std::uint32_t kUnwindGraceMs = 250;
+        constexpr std::uint32_t kTerminalUnwindVerifyMs = 1000;
 
         SafetyHookInline g_hook{};
 
@@ -371,7 +372,7 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
                     logs::warn(
                         "[SiteARenderBreaker.forensics] PRE-SIGNAL episode={} "
                         "attempt={} workid={} deep=0x{:x} render_RIP=0x{:x} ({})",
-                        a_seq, signalCount + 1, a_workIdEntry, deepHandle,
+                        a_seq, signalCount + 1, currentWorkId, deepHandle,
                         beforeSnap.rip, ModuleName(beforeSnap.rip));
                     LogHandleReferences("PRE-SIGNAL", deepHandle, renderTid);
                 }
@@ -458,6 +459,112 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
                     afterProtocol.ok ? afterProtocol.workid : 0xffffffffu,
                     afterProtocol.ok ? afterProtocol.ack : 0,
                     afterSnap.rdi };
+
+                // v2.6.6 terminal recovery: field evidence from episode 2105 showed
+                // four independently validated deep completions ending with work-id 0,
+                // unchanged outer ack, and no remaining deep event (RDI=0). v2.6.5
+                // incorrectly treated that terminal state as another deep candidate and
+                // then aborted on the next loop. Give the render join time to unwind;
+                // if no new deep event appears and the exact same Site-A protocol remains
+                // stalled, recover the outer worker-ack as a lost final completion.
+                const bool terminalDeepChain =
+                    signalCount > 0 &&
+                    currentWorkId == 0 &&
+                    afterProtocol.ok &&
+                    after.workid == 0 &&
+                    after.outer_ack == a_ackEntry &&
+                    after.deep_handle == 0 &&
+                    QueryEventState(a_ackEntry) == 0;
+
+                if (terminalDeepChain) {
+                    logs::warn(
+                        "[SiteARenderBreaker] TERMINAL DEEP CHAIN: signal 0x{:x} "
+                        "left no further deep wait; verifying natural unwind before "
+                        "outer-ack recovery (signals={}, ack=0x{:x}, episode={}).",
+                        deepHandle, signalCount, a_ackEntry, a_seq);
+
+                    bool newDeepWait = false;
+                    for (std::uint32_t waited = 0;
+                         waited < kTerminalUnwindVerifyMs &&
+                         g_running.load(std::memory_order_relaxed);
+                         waited += kVerifyStepMs)
+                    {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(kVerifyStepMs));
+
+                        if (!g_in_wait.load(std::memory_order_acquire) ||
+                            g_episode_seq.load(std::memory_order_relaxed) != a_seq)
+                        {
+                            logs::warn(
+                                "[SiteARenderBreaker] VERIFIED TERMINAL RELEASE: "
+                                "render join unwound naturally after {} signal(s) "
+                                "(episode={}).", signalCount, a_seq);
+                            return true;
+                        }
+
+                        if (QueryEventState(a_ackEntry) == 1) {
+                            logs::warn(
+                                "[SiteARenderBreaker] VERIFIED TERMINAL RELEASE: "
+                                "outer ack 0x{:x} became signaled naturally "
+                                "(episode={}).", a_ackEntry, a_seq);
+                            return true;
+                        }
+
+                        ThreadSnap probe{};
+                        if (CaptureThread(renderTid, probe) &&
+                            IsInsideRenderTaskJoin(probe) &&
+                            probe.rdi != 0 && probe.r14 == probe.rdi)
+                        {
+                            newDeepWait = true;
+                            break;
+                        }
+                    }
+
+                    if (newDeepWait) {
+                        logs::warn(
+                            "[SiteARenderBreaker] TERMINAL VERIFY: a new validated "
+                            "deep wait appeared; returning to normal progress-gated "
+                            "recovery (episode={}).", a_seq);
+                        continue;
+                    }
+
+                    const auto finalProtocol = ReadSiteA(singleton);
+                    ThreadSnap finalSnap{};
+                    const bool finalShape =
+                        finalProtocol.ok &&
+                        finalProtocol.workid == 0 &&
+                        finalProtocol.ack == a_ackEntry &&
+                        QueryEventState(a_ackEntry) == 0 &&
+                        CaptureThread(renderTid, finalSnap) &&
+                        IsInsideRenderTaskJoin(finalSnap) &&
+                        finalSnap.rdi == 0;
+
+                    if (!finalShape) {
+                        logs::error(
+                            "[SiteARenderBreaker] TERMINAL ACK RECOVERY ABORTED: "
+                            "post-chain protocol/join shape changed during verification "
+                            "(episode={}).", a_seq);
+                        return false;
+                    }
+
+                    logs::warn(
+                        "[SiteARenderBreaker] TERMINAL ACK RECOVERY: deep chain is "
+                        "exhausted, workid=0, outer ack 0x{:x} remains unsignaled, "
+                        "and render is still parked in the same id-34557 episode; "
+                        "signaling final worker ack (episode={}).",
+                        a_ackEntry, a_seq);
+
+                    if (!::SetEvent(reinterpret_cast<HANDLE>(a_ackEntry))) {
+                        logs::error(
+                            "[SiteARenderBreaker] TERMINAL ACK RECOVERY FAILED: "
+                            "SetEvent(0x{:x}) returned false (GetLastError={}, "
+                            "episode={}).",
+                            a_ackEntry, ::GetLastError(), a_seq);
+                        return false;
+                    }
+
+                    return true;
+                }
 
                 const bool nextSeen = SeenHandle(
                     seen, signalCount, after.deep_handle);
