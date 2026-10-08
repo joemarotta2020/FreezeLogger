@@ -1,9 +1,9 @@
-name: Build WorkerSpinLockFix v2.6.5 handoff recovery
+name: Build WorkerSpinLockFix v2.6.6 terminal recovery
 
 on:
   push:
     branches:
-      - sitea-v265-handoff
+      - sitea-v266-terminal-release
     paths:
       - "skyrim-freeze-fix/**"
       - ".github/workflows/build-workerspinlockfix.yml"
@@ -26,7 +26,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Apply v2.6.5 handoff rebaseline patch
+      - name: Apply v2.6.6 terminal deep-chain recovery patch
         run: |
           $script = @'
           from pathlib import Path
@@ -34,68 +34,51 @@ jobs:
           p = Path("src/SiteARenderBreaker_v264.cpp")
           s = p.read_text(encoding="utf-8")
 
-          old = """            const auto recoveryStart = NowMs();\n            std::array<std::uintptr_t, kMaxDeepSignals> seen{};\n            std::uint32_t signalCount = 0;\n            const DWORD renderTid = g_worker_tid.load(std::memory_order_relaxed);\n"""
-          new = """            const auto recoveryStart = NowMs();\n            std::array<std::uintptr_t, kMaxDeepSignals> seen{};\n            std::uint32_t signalCount = 0;\n            std::uint32_t currentWorkId = a_workIdEntry;\n            const DWORD renderTid = g_worker_tid.load(std::memory_order_relaxed);\n"""
-          assert s.count(old) == 1, "recoveryStart anchor mismatch"
+          old = "        constexpr std::uint32_t kUnwindGraceMs = 250;\n"
+          new = old + "        constexpr std::uint32_t kTerminalUnwindVerifyMs = 1000;\n"
+          assert s.count(old) == 1, "terminal verify constant anchor mismatch"
           s = s.replace(old, new, 1)
 
-          old = """                if (!protocol.ok || protocol.workid != a_workIdEntry ||\n                    protocol.ack != a_ackEntry)\n                {\n                    logs::error(\n                        \"[SiteARenderBreaker] DEEP RECOVERY ABORTED: Singleton-A \"\n                        \"protocol changed before signal (entry workid={}, now={}, \"\n                        \"entry ack=0x{:x}, now=0x{:x}, episode={}).\",\n                        a_workIdEntry, protocol.workid,\n                        a_ackEntry, protocol.ack, a_seq);\n                    return false;\n                }\n"""
-          new = """                if (!protocol.ok || protocol.workid != currentWorkId ||\n                    protocol.ack != a_ackEntry)\n                {\n                    logs::error(\n                        \"[SiteARenderBreaker] DEEP RECOVERY ABORTED: Singleton-A \"\n                        \"protocol changed before signal (baseline workid={}, now={}, \"\n                        \"entry ack=0x{:x}, now=0x{:x}, episode={}).\",\n                        currentWorkId, protocol.workid,\n                        a_ackEntry, protocol.ack, a_seq);\n                    return false;\n                }\n"""
-          assert s.count(old) == 1, "pre-signal protocol gate anchor mismatch"
+          old = """                        a_seq, signalCount + 1, a_workIdEntry, deepHandle,\n"""
+          new = """                        a_seq, signalCount + 1, currentWorkId, deepHandle,\n"""
+          assert s.count(old) == 1, "diagnostic workid anchor mismatch"
           s = s.replace(old, new, 1)
 
-          old = """                RecoveryPolicy::DeepProgress before{\n                    true, a_seq, a_workIdEntry, a_ackEntry, deepHandle };\n"""
-          new = """                RecoveryPolicy::DeepProgress before{\n                    true, a_seq, currentWorkId, a_ackEntry, deepHandle };\n"""
-          assert s.count(old) == 1, "DeepProgress baseline anchor mismatch"
-          s = s.replace(old, new, 1)
-
-          old = """                const bool nextSeen = SeenHandle(\n                    seen, signalCount, after.deep_handle);\n                const auto decision = RecoveryPolicy::Evaluate(\n                    before, after, nextSeen);\n\n                if (decision == RecoveryPolicy::Decision::Complete) {\n                    return true;\n                }\n"""
-          new = """                const bool nextSeen = SeenHandle(\n                    seen, signalCount, after.deep_handle);\n\n                // Field-validated v2.6.5 handoff exception. A successful deep\n                // signal can complete one work item and make Singleton-A clear\n                // work-id from nonzero to 0 while id 34557 immediately parks on\n                // the next real sub-task event. That is forward progress, not a\n                // protocol failure, but only when every other invariant still\n                // proves we are in the same stalled join. Re-baseline once the\n                // new wait is independently validated; all other protocol\n                // mutations still fail closed through RecoveryPolicy::Evaluate.\n                const bool handoffCandidate =\n                    before.workid != 0 &&\n                    after.workid == 0 &&\n                    after.outer_ack == before.outer_ack &&\n                    after.deep_handle != 0 &&\n                    after.deep_handle != before.deep_handle &&\n                    afterSnap.r14 == after.deep_handle &&\n                    !nextSeen &&\n                    afterProtocol.ok &&\n                    after.deep_handle != afterProtocol.ack &&\n                    after.deep_handle != afterProtocol.wake &&\n                    QueryEventState(after.deep_handle) == 0;\n\n                if (handoffCandidate) {\n                    logs::warn(\n                        \"[SiteARenderBreaker] HANDOFF REBASELINED: validated deep \"\n                        \"signal 0x{:x} advanced workid {}->0 and render is now \"\n                        \"parked on new unsignaled sub-task event 0x{:x}; outer \"\n                        \"ack remains 0x{:x}. Continuing within bounded budget \"\n                        \"(episode={}).\",\n                        deepHandle, currentWorkId, after.deep_handle,\n                        a_ackEntry, a_seq);\n                    currentWorkId = 0;\n                    if (g_diag) {\n                        LogHandleReferences(\n                            \"HANDOFF-NEXT-CANDIDATE\",\n                            after.deep_handle, renderTid);\n                    }\n                    continue;\n                }\n\n                const auto decision = RecoveryPolicy::Evaluate(\n                    before, after, nextSeen);\n\n                if (decision == RecoveryPolicy::Decision::Complete) {\n                    return true;\n                }\n"""
-          assert s.count(old) == 1, "post-signal decision anchor mismatch"
-          s = s.replace(old, new, 1)
-
-          old = """                        DecisionName(decision), deepHandle, after.deep_handle,\n                        a_workIdEntry, after.workid,\n                        a_ackEntry, after.outer_ack, a_seq);\n"""
-          new = """                        DecisionName(decision), deepHandle, after.deep_handle,\n                        currentWorkId, after.workid,\n                        a_ackEntry, after.outer_ack, a_seq);\n"""
-          assert s.count(old) == 1, "abort log workid anchor mismatch"
-          s = s.replace(old, new, 1)
+          anchor = """                const bool nextSeen = SeenHandle(\n                    seen, signalCount, after.deep_handle);\n"""
+          insert = """                // v2.6.6 terminal recovery: field evidence from episode 2105 showed\n                // four independently validated deep completions ending with work-id 0,\n                // unchanged outer ack, and no remaining deep event (RDI=0). v2.6.5\n                // incorrectly treated that terminal state as another deep candidate and\n                // then aborted on the next loop. Give the render join time to unwind;\n                // if no new deep event appears and the exact same Site-A protocol remains\n                // stalled, recover the outer worker-ack as a lost final completion.\n                const bool terminalDeepChain =\n                    signalCount > 0 &&\n                    currentWorkId == 0 &&\n                    afterProtocol.ok &&\n                    after.workid == 0 &&\n                    after.outer_ack == a_ackEntry &&\n                    after.deep_handle == 0 &&\n                    QueryEventState(a_ackEntry) == 0;\n\n                if (terminalDeepChain) {\n                    logs::warn(\n                        \"[SiteARenderBreaker] TERMINAL DEEP CHAIN: signal 0x{:x} \"\n                        \"left no further deep wait; verifying natural unwind before \"\n                        \"outer-ack recovery (signals={}, ack=0x{:x}, episode={}).\",\n                        deepHandle, signalCount, a_ackEntry, a_seq);\n\n                    bool newDeepWait = false;\n                    for (std::uint32_t waited = 0;\n                         waited < kTerminalUnwindVerifyMs &&\n                         g_running.load(std::memory_order_relaxed);\n                         waited += kVerifyStepMs)\n                    {\n                        std::this_thread::sleep_for(\n                            std::chrono::milliseconds(kVerifyStepMs));\n\n                        if (!g_in_wait.load(std::memory_order_acquire) ||\n                            g_episode_seq.load(std::memory_order_relaxed) != a_seq)\n                        {\n                            logs::warn(\n                                \"[SiteARenderBreaker] VERIFIED TERMINAL RELEASE: \"\n                                \"render join unwound naturally after {} signal(s) \"\n                                \"(episode={}).\", signalCount, a_seq);\n                            return true;\n                        }\n\n                        if (QueryEventState(a_ackEntry) == 1) {\n                            logs::warn(\n                                \"[SiteARenderBreaker] VERIFIED TERMINAL RELEASE: \"\n                                \"outer ack 0x{:x} became signaled naturally \"\n                                \"(episode={}).\", a_ackEntry, a_seq);\n                            return true;\n                        }\n\n                        ThreadSnap probe{};\n                        if (CaptureThread(renderTid, probe) &&\n                            IsInsideRenderTaskJoin(probe) &&\n                            probe.rdi != 0 && probe.r14 == probe.rdi)\n                        {\n                            newDeepWait = true;\n                            break;\n                        }\n                    }\n\n                    if (newDeepWait) {\n                        logs::warn(\n                            \"[SiteARenderBreaker] TERMINAL VERIFY: a new validated \"\n                            \"deep wait appeared; returning to normal progress-gated \"\n                            \"recovery (episode={}).\", a_seq);\n                        continue;\n                    }\n\n                    const auto finalProtocol = ReadSiteA(singleton);\n                    ThreadSnap finalSnap{};\n                    const bool finalShape =\n                        finalProtocol.ok &&\n                        finalProtocol.workid == 0 &&\n                        finalProtocol.ack == a_ackEntry &&\n                        QueryEventState(a_ackEntry) == 0 &&\n                        CaptureThread(renderTid, finalSnap) &&\n                        IsInsideRenderTaskJoin(finalSnap) &&\n                        finalSnap.rdi == 0;\n\n                    if (!finalShape) {\n                        logs::error(\n                            \"[SiteARenderBreaker] TERMINAL ACK RECOVERY ABORTED: \"\n                            \"post-chain protocol/join shape changed during verification \"\n                            \"(episode={}).\", a_seq);\n                        return false;\n                    }\n\n                    logs::warn(\n                        \"[SiteARenderBreaker] TERMINAL ACK RECOVERY: deep chain is \"\n                        \"exhausted, workid=0, outer ack 0x{:x} remains unsignaled, \"\n                        \"and render is still parked in the same id-34557 episode; \"\n                        \"signaling final worker ack (episode={}).\",\n                        a_ackEntry, a_seq);\n\n                    if (!::SetEvent(reinterpret_cast<HANDLE>(a_ackEntry))) {\n                        logs::error(\n                            \"[SiteARenderBreaker] TERMINAL ACK RECOVERY FAILED: \"\n                            \"SetEvent(0x{:x}) returned false (GetLastError={}, \"\n                            \"episode={}).\",\n                            a_ackEntry, ::GetLastError(), a_seq);\n                        return false;\n                    }\n\n                    return true;\n                }\n\n"""
+          assert s.count(anchor) == 1, "terminal recovery insertion anchor mismatch"
+          s = s.replace(anchor, insert + anchor, 1)
 
           p.write_text(s, encoding="utf-8")
 
           cm = Path("CMakeLists.txt")
           c = cm.read_text(encoding="utf-8")
-          assert c.count("VERSION       2.6.4") == 1, "CMake version anchor mismatch"
-          c = c.replace("VERSION       2.6.4", "VERSION       2.6.5", 1)
-          c = c.replace(
-              "v2.6.4 adds verified active WaitForJobTask recovery and progress-gated render-side Site-A deep recovery with bounded multi-event continuation and targeted handle-reference diagnostics.",
-              "v2.6.5 retains verified active WaitForJobTask recovery and adds a fail-closed render-side Site-A handoff rebaseline for the field-observed work-id nonzero-to-zero transition after a validated deep signal.",
-              1)
+          assert c.count("VERSION       2.6.5") == 1, "CMake version anchor mismatch"
+          c = c.replace("VERSION       2.6.5", "VERSION       2.6.6", 1)
+          old_desc = "v2.6.5 retains verified active WaitForJobTask recovery and adds a fail-closed render-side Site-A handoff rebaseline for the field-observed work-id nonzero-to-zero transition after a validated deep signal."
+          new_desc = "v2.6.6 retains the v2.6.5 handoff gate and adds field-validated terminal outer-ack recovery when a verified deep chain exhausts at work-id zero without naturally completing the Site-A episode."
+          assert old_desc in c, "CMake description anchor mismatch"
+          c = c.replace(old_desc, new_desc, 1)
           cm.write_text(c, encoding="utf-8")
 
           toml = Path("dist/WorkerSpinLockFix.toml")
           t = toml.read_text(encoding="utf-8")
-          t = t.replace("WorkerSpinLockFix v2.6.4", "WorkerSpinLockFix v2.6.5", 1)
-          marker = "# Active SE 1.5.97 deep recovery. The old four-signal cap is replaced by a\n"
-          if marker in t:
-              t = t.replace(marker,
-                  "# Active SE 1.5.97 deep recovery. v2.6.5 also permits one narrowly\n"
-                  "# validated handoff: after a successful deep signal, work-id may clear\n"
-                  "# from nonzero to 0 if the outer ack is unchanged and render is proven\n"
-                  "# parked on a new unsignaled deep event in the same id-34557 episode.\n"
-                  "# The old four-signal cap is replaced by a\n", 1)
+          t = t.replace("WorkerSpinLockFix v2.6.5", "WorkerSpinLockFix v2.6.6", 1)
+          t += "\n# v2.6.6: after a verified bounded deep chain reaches work-id 0 with no remaining\n# deep event, revalidate the same id-34557 episode for 1s before signaling the\n# unchanged unsignaled outer worker-ack. Any protocol change still aborts.\n"
           toml.write_text(t, encoding="utf-8")
           '@
-          $script | Set-Content -Path "$env:RUNNER_TEMP\apply_v265.py" -Encoding utf8
-          python "$env:RUNNER_TEMP\apply_v265.py"
+          $script | Set-Content -Path "$env:RUNNER_TEMP\apply_v266.py" -Encoding utf8
+          python "$env:RUNNER_TEMP\apply_v266.py"
           git diff --check
           git diff -- src/SiteARenderBreaker_v264.cpp CMakeLists.txt dist/WorkerSpinLockFix.toml
 
-      - name: Persist v2.6.5 source patch
+      - name: Persist v2.6.6 source patch
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src/SiteARenderBreaker_v264.cpp CMakeLists.txt dist/WorkerSpinLockFix.toml
-          git commit -m "WorkerSpinLockFix v2.6.5 handoff rebaseline" || echo "No source changes to commit"
-          git push origin HEAD:sitea-v265-handoff
+          git commit -m "WorkerSpinLockFix v2.6.6 terminal Site-A recovery" || echo "No source changes to commit"
+          git push origin HEAD:sitea-v266-terminal-release
 
       - name: Configure environment
         run: |
@@ -113,23 +96,19 @@ jobs:
         run: |
           $out = Join-Path $env:GITHUB_WORKSPACE "artifact"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
-
           $dll = Get-ChildItem -Path "C:\sk\wslf\r" -Recurse -Filter "WorkerSpinLockFix.dll" | Select-Object -First 1
           $pdb = Get-ChildItem -Path "C:\sk\wslf\r" -Recurse -Filter "WorkerSpinLockFix.pdb" | Select-Object -First 1
-
           if (-not $dll) { throw "WorkerSpinLockFix.dll not found" }
           if (-not $pdb) { throw "WorkerSpinLockFix.pdb not found" }
-
           Copy-Item $dll.FullName (Join-Path $out "WorkerSpinLockFix.dll")
           Copy-Item $pdb.FullName (Join-Path $out "WorkerSpinLockFix.pdb")
           Copy-Item "dist\WorkerSpinLockFix.toml" (Join-Path $out "WorkerSpinLockFix.toml")
-
           Get-FileHash (Join-Path $out "WorkerSpinLockFix.dll") -Algorithm SHA256
           Get-ChildItem $out | Format-Table Name,Length
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WorkerSpinLockFix-v2.6.5
+          name: WorkerSpinLockFix-v2.6.6
           path: artifact/*
           if-no-files-found: error
