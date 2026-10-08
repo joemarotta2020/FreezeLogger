@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.26)
 
 project(WorkerSpinLockFix
-    VERSION       2.6.4
-    DESCRIPTION   "SKSE hard-freeze recovery for Skyrim SE/AE. v2.6.4 adds verified active WaitForJobTask recovery and progress-gated render-side Site-A deep recovery with bounded multi-event continuation and targeted handle-reference diagnostics."
+    VERSION       2.6.5
+    DESCRIPTION   "SKSE hard-freeze recovery for Skyrim SE/AE. v2.6.5 retains verified active WaitForJobTask recovery and adds a fail-closed render-side Site-A handoff rebaseline for the field-observed work-id nonzero-to-zero transition after a validated deep signal."
     LANGUAGES     CXX
 )
 

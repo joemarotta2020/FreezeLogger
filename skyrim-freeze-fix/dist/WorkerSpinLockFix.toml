@@ -1,4 +1,4 @@
-# WorkerSpinLockFix v2.6.4 - field diagnostic/recovery profile
+# WorkerSpinLockFix v2.6.5 - field diagnostic/recovery profile
 # Read once at SKSEPlugin_Load; restart Skyrim after changing this file.
 
 [plugin]
@@ -33,7 +33,11 @@ poll_interval_ms = 1000
 recheck_window_ms = 1500
 diagnostic_logging = true
 
-# Active SE 1.5.97 deep recovery. The old four-signal cap is replaced by a
+# Active SE 1.5.97 deep recovery. v2.6.5 also permits one narrowly
+# validated handoff: after a successful deep signal, work-id may clear
+# from nonzero to 0 if the outer ack is unchanged and render is proven
+# parked on a new unsignaled deep event in the same id-34557 episode.
+# The old four-signal cap is replaced by a
 # dual budget (12 signals / 6000 ms) but continuation is allowed ONLY when the
 # previous signal demonstrably advances id 34557 to a new unsignaled event
 # while episode, work-id and outer ack remain unchanged. Repeats, no-progress,

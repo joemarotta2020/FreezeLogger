@@ -304,6 +304,7 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
             const auto recoveryStart = NowMs();
             std::array<std::uintptr_t, kMaxDeepSignals> seen{};
             std::uint32_t signalCount = 0;
+            std::uint32_t currentWorkId = a_workIdEntry;
             const DWORD renderTid = g_worker_tid.load(std::memory_order_relaxed);
 
             while (RecoveryPolicy::WithinBudget(
@@ -340,14 +341,14 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
                 const auto singleton =
                     g_episode_singleton.load(std::memory_order_relaxed);
                 const auto protocol = ReadSiteA(singleton);
-                if (!protocol.ok || protocol.workid != a_workIdEntry ||
+                if (!protocol.ok || protocol.workid != currentWorkId ||
                     protocol.ack != a_ackEntry)
                 {
                     logs::error(
                         "[SiteARenderBreaker] DEEP RECOVERY ABORTED: Singleton-A "
-                        "protocol changed before signal (entry workid={}, now={}, "
+                        "protocol changed before signal (baseline workid={}, now={}, "
                         "entry ack=0x{:x}, now=0x{:x}, episode={}).",
-                        a_workIdEntry, protocol.workid,
+                        currentWorkId, protocol.workid,
                         a_ackEntry, protocol.ack, a_seq);
                     return false;
                 }
@@ -450,7 +451,7 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
 
                 const auto afterProtocol = ReadSiteA(singleton);
                 RecoveryPolicy::DeepProgress before{
-                    true, a_seq, a_workIdEntry, a_ackEntry, deepHandle };
+                    true, a_seq, currentWorkId, a_ackEntry, deepHandle };
                 RecoveryPolicy::DeepProgress after{
                     g_in_wait.load(std::memory_order_acquire),
                     g_episode_seq.load(std::memory_order_relaxed),
@@ -460,6 +461,46 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
 
                 const bool nextSeen = SeenHandle(
                     seen, signalCount, after.deep_handle);
+
+                // Field-validated v2.6.5 handoff exception. A successful deep
+                // signal can complete one work item and make Singleton-A clear
+                // work-id from nonzero to 0 while id 34557 immediately parks on
+                // the next real sub-task event. That is forward progress, not a
+                // protocol failure, but only when every other invariant still
+                // proves we are in the same stalled join. Re-baseline once the
+                // new wait is independently validated; all other protocol
+                // mutations still fail closed through RecoveryPolicy::Evaluate.
+                const bool handoffCandidate =
+                    before.workid != 0 &&
+                    after.workid == 0 &&
+                    after.outer_ack == before.outer_ack &&
+                    after.deep_handle != 0 &&
+                    after.deep_handle != before.deep_handle &&
+                    afterSnap.r14 == after.deep_handle &&
+                    !nextSeen &&
+                    afterProtocol.ok &&
+                    after.deep_handle != afterProtocol.ack &&
+                    after.deep_handle != afterProtocol.wake &&
+                    QueryEventState(after.deep_handle) == 0;
+
+                if (handoffCandidate) {
+                    logs::warn(
+                        "[SiteARenderBreaker] HANDOFF REBASELINED: validated deep "
+                        "signal 0x{:x} advanced workid {}->0 and render is now "
+                        "parked on new unsignaled sub-task event 0x{:x}; outer "
+                        "ack remains 0x{:x}. Continuing within bounded budget "
+                        "(episode={}).",
+                        deepHandle, currentWorkId, after.deep_handle,
+                        a_ackEntry, a_seq);
+                    currentWorkId = 0;
+                    if (g_diag) {
+                        LogHandleReferences(
+                            "HANDOFF-NEXT-CANDIDATE",
+                            after.deep_handle, renderTid);
+                    }
+                    continue;
+                }
+
                 const auto decision = RecoveryPolicy::Evaluate(
                     before, after, nextSeen);
 
@@ -472,7 +513,7 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
                         "gate: reason={} old=0x{:x} new=0x{:x} workid {}->{} "
                         "ack 0x{:x}->0x{:x} episode={}",
                         DecisionName(decision), deepHandle, after.deep_handle,
-                        a_workIdEntry, after.workid,
+                        currentWorkId, after.workid,
                         a_ackEntry, after.outer_ack, a_seq);
                     return false;
                 }
