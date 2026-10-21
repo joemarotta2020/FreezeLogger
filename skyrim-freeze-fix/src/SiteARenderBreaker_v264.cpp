@@ -579,6 +579,7 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
                 // and the established work-id-zero terminal shape may use v2.6.6's final
                 // outer-ack recovery. Otherwise fail closed.
                 if (RecoveryPolicy::ShouldReprobeZeroCandidate(after, signalCount)) {
+                    lastProgressMs = NowMs(); // zero-candidate transition is verified movement
                     logs::warn(
                         "[SiteARenderBreaker] ZERO-CANDIDATE REPROBE: validated signal "
                         "0x{:x} advanced the chain but exposed no deep event while "
@@ -590,6 +591,7 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
                     bool foundDeepWait = false;
                     for (std::uint32_t waited = 0;
                          waited < kZeroCandidateReprobeMs &&
+                         NowMs() - recoveryStart < kMaxDeepRecoveryMs &&
                          g_running.load(std::memory_order_relaxed);
                          waited += kVerifyStepMs)
                     {
