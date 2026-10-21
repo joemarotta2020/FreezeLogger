@@ -1,16 +1,16 @@
-name: Build WorkerSpinLockFix v2.6.6 terminal recovery
+name: Build WorkerSpinLockFix v2.6.7 progress window
 
 on:
   push:
     branches:
-      - sitea-v266-terminal-release
+      - sitea-v267-progress-window
     paths:
       - "skyrim-freeze-fix/**"
       - ".github/workflows/build-workerspinlockfix.yml"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -26,59 +26,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Apply v2.6.6 terminal deep-chain recovery patch
+      - name: Verify clean committed source
         run: |
-          $script = @'
-          from pathlib import Path
-
-          p = Path("src/SiteARenderBreaker_v264.cpp")
-          s = p.read_text(encoding="utf-8")
-
-          old = "        constexpr std::uint32_t kUnwindGraceMs = 250;\n"
-          new = old + "        constexpr std::uint32_t kTerminalUnwindVerifyMs = 1000;\n"
-          assert s.count(old) == 1, "terminal verify constant anchor mismatch"
-          s = s.replace(old, new, 1)
-
-          old = """                        a_seq, signalCount + 1, a_workIdEntry, deepHandle,\n"""
-          new = """                        a_seq, signalCount + 1, currentWorkId, deepHandle,\n"""
-          assert s.count(old) == 1, "diagnostic workid anchor mismatch"
-          s = s.replace(old, new, 1)
-
-          anchor = """                const bool nextSeen = SeenHandle(\n                    seen, signalCount, after.deep_handle);\n"""
-          insert = """                // v2.6.6 terminal recovery: field evidence from episode 2105 showed\n                // four independently validated deep completions ending with work-id 0,\n                // unchanged outer ack, and no remaining deep event (RDI=0). v2.6.5\n                // incorrectly treated that terminal state as another deep candidate and\n                // then aborted on the next loop. Give the render join time to unwind;\n                // if no new deep event appears and the exact same Site-A protocol remains\n                // stalled, recover the outer worker-ack as a lost final completion.\n                const bool terminalDeepChain =\n                    signalCount > 0 &&\n                    currentWorkId == 0 &&\n                    afterProtocol.ok &&\n                    after.workid == 0 &&\n                    after.outer_ack == a_ackEntry &&\n                    after.deep_handle == 0 &&\n                    QueryEventState(a_ackEntry) == 0;\n\n                if (terminalDeepChain) {\n                    logs::warn(\n                        \"[SiteARenderBreaker] TERMINAL DEEP CHAIN: signal 0x{:x} \"\n                        \"left no further deep wait; verifying natural unwind before \"\n                        \"outer-ack recovery (signals={}, ack=0x{:x}, episode={}).\",\n                        deepHandle, signalCount, a_ackEntry, a_seq);\n\n                    bool newDeepWait = false;\n                    for (std::uint32_t waited = 0;\n                         waited < kTerminalUnwindVerifyMs &&\n                         g_running.load(std::memory_order_relaxed);\n                         waited += kVerifyStepMs)\n                    {\n                        std::this_thread::sleep_for(\n                            std::chrono::milliseconds(kVerifyStepMs));\n\n                        if (!g_in_wait.load(std::memory_order_acquire) ||\n                            g_episode_seq.load(std::memory_order_relaxed) != a_seq)\n                        {\n                            logs::warn(\n                                \"[SiteARenderBreaker] VERIFIED TERMINAL RELEASE: \"\n                                \"render join unwound naturally after {} signal(s) \"\n                                \"(episode={}).\", signalCount, a_seq);\n                            return true;\n                        }\n\n                        if (QueryEventState(a_ackEntry) == 1) {\n                            logs::warn(\n                                \"[SiteARenderBreaker] VERIFIED TERMINAL RELEASE: \"\n                                \"outer ack 0x{:x} became signaled naturally \"\n                                \"(episode={}).\", a_ackEntry, a_seq);\n                            return true;\n                        }\n\n                        ThreadSnap probe{};\n                        if (CaptureThread(renderTid, probe) &&\n                            IsInsideRenderTaskJoin(probe) &&\n                            probe.rdi != 0 && probe.r14 == probe.rdi)\n                        {\n                            newDeepWait = true;\n                            break;\n                        }\n                    }\n\n                    if (newDeepWait) {\n                        logs::warn(\n                            \"[SiteARenderBreaker] TERMINAL VERIFY: a new validated \"\n                            \"deep wait appeared; returning to normal progress-gated \"\n                            \"recovery (episode={}).\", a_seq);\n                        continue;\n                    }\n\n                    const auto finalProtocol = ReadSiteA(singleton);\n                    ThreadSnap finalSnap{};\n                    const bool finalShape =\n                        finalProtocol.ok &&\n                        finalProtocol.workid == 0 &&\n                        finalProtocol.ack == a_ackEntry &&\n                        QueryEventState(a_ackEntry) == 0 &&\n                        CaptureThread(renderTid, finalSnap) &&\n                        IsInsideRenderTaskJoin(finalSnap) &&\n                        finalSnap.rdi == 0;\n\n                    if (!finalShape) {\n                        logs::error(\n                            \"[SiteARenderBreaker] TERMINAL ACK RECOVERY ABORTED: \"\n                            \"post-chain protocol/join shape changed during verification \"\n                            \"(episode={}).\", a_seq);\n                        return false;\n                    }\n\n                    logs::warn(\n                        \"[SiteARenderBreaker] TERMINAL ACK RECOVERY: deep chain is \"\n                        \"exhausted, workid=0, outer ack 0x{:x} remains unsignaled, \"\n                        \"and render is still parked in the same id-34557 episode; \"\n                        \"signaling final worker ack (episode={}).\",\n                        a_ackEntry, a_seq);\n\n                    if (!::SetEvent(reinterpret_cast<HANDLE>(a_ackEntry))) {\n                        logs::error(\n                            \"[SiteARenderBreaker] TERMINAL ACK RECOVERY FAILED: \"\n                            \"SetEvent(0x{:x}) returned false (GetLastError={}, \"\n                            \"episode={}).\",\n                            a_ackEntry, ::GetLastError(), a_seq);\n                        return false;\n                    }\n\n                    return true;\n                }\n\n"""
-          assert s.count(anchor) == 1, "terminal recovery insertion anchor mismatch"
-          s = s.replace(anchor, insert + anchor, 1)
-
-          p.write_text(s, encoding="utf-8")
-
-          cm = Path("CMakeLists.txt")
-          c = cm.read_text(encoding="utf-8")
-          assert c.count("VERSION       2.6.5") == 1, "CMake version anchor mismatch"
-          c = c.replace("VERSION       2.6.5", "VERSION       2.6.6", 1)
-          old_desc = "v2.6.5 retains verified active WaitForJobTask recovery and adds a fail-closed render-side Site-A handoff rebaseline for the field-observed work-id nonzero-to-zero transition after a validated deep signal."
-          new_desc = "v2.6.6 retains the v2.6.5 handoff gate and adds field-validated terminal outer-ack recovery when a verified deep chain exhausts at work-id zero without naturally completing the Site-A episode."
-          assert old_desc in c, "CMake description anchor mismatch"
-          c = c.replace(old_desc, new_desc, 1)
-          cm.write_text(c, encoding="utf-8")
-
-          toml = Path("dist/WorkerSpinLockFix.toml")
-          t = toml.read_text(encoding="utf-8")
-          t = t.replace("WorkerSpinLockFix v2.6.5", "WorkerSpinLockFix v2.6.6", 1)
-          t += "\n# v2.6.6: after a verified bounded deep chain reaches work-id 0 with no remaining\n# deep event, revalidate the same id-34557 episode for 1s before signaling the\n# unchanged unsignaled outer worker-ack. Any protocol change still aborts.\n"
-          toml.write_text(t, encoding="utf-8")
-          '@
-          $script | Set-Content -Path "$env:RUNNER_TEMP\apply_v266.py" -Encoding utf8
-          python "$env:RUNNER_TEMP\apply_v266.py"
           git diff --check
-          git diff -- src/SiteARenderBreaker_v264.cpp CMakeLists.txt dist/WorkerSpinLockFix.toml
-
-      - name: Persist v2.6.6 source patch
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/SiteARenderBreaker_v264.cpp CMakeLists.txt dist/WorkerSpinLockFix.toml
-          git commit -m "WorkerSpinLockFix v2.6.6 terminal Site-A recovery" || echo "No source changes to commit"
-          git push origin HEAD:sitea-v266-terminal-release
+          if (git status --porcelain) { throw "Checkout is not clean" }
+          git log -1 --oneline
 
       - name: Configure environment
         run: |
@@ -109,6 +61,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WorkerSpinLockFix-v2.6.6
+          name: WorkerSpinLockFix-sitea-v267
           path: artifact/*
           if-no-files-found: error
