@@ -16,7 +16,9 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
         constexpr std::uintptr_t kOffWorkId = 0x68;
 
         constexpr std::uint32_t kMaxDeepSignals = 12;
-        constexpr std::uint64_t kMaxDeepRecoveryMs = 6000;
+        constexpr std::uint64_t kMaxDeepRecoveryMs = 15000;
+        constexpr std::uint64_t kMaxNoProgressMs = 2500;
+        constexpr std::uint32_t kZeroCandidateReprobeMs = 2500;
         constexpr std::uint32_t kVerifyMs = 500;
         constexpr std::uint32_t kVerifyStepMs = 25;
         constexpr std::uint32_t kUnwindGraceMs = 250;
@@ -303,14 +305,16 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
             }
 
             const auto recoveryStart = NowMs();
+            auto lastProgressMs = recoveryStart;
             std::array<std::uintptr_t, kMaxDeepSignals> seen{};
             std::uint32_t signalCount = 0;
             std::uint32_t currentWorkId = a_workIdEntry;
             const DWORD renderTid = g_worker_tid.load(std::memory_order_relaxed);
 
-            while (RecoveryPolicy::WithinBudget(
+            while (RecoveryPolicy::WithinProgressBudget(
                 signalCount, NowMs() - recoveryStart,
-                kMaxDeepSignals, kMaxDeepRecoveryMs))
+                NowMs() - lastProgressMs,
+                kMaxDeepSignals, kMaxDeepRecoveryMs, kMaxNoProgressMs))
             {
                 if (!g_in_wait.load(std::memory_order_acquire) ||
                     g_episode_seq.load(std::memory_order_relaxed) != a_seq)
@@ -521,6 +525,7 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
                     }
 
                     if (newDeepWait) {
+                        lastProgressMs = NowMs();
                         logs::warn(
                             "[SiteARenderBreaker] TERMINAL VERIFY: a new validated "
                             "deep wait appeared; returning to normal progress-gated "
@@ -566,6 +571,137 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
                     return true;
                 }
 
+                // v2.6.7: the 2026-10-21 field capture advanced through nine
+                // independently validated deep waits and then briefly exposed RDI=0
+                // while work-id was still nonzero. That is not permission to signal
+                // anything. Re-probe the same join for the full inactivity budget: a
+                // natural unwind succeeds, a new validated deep event refreshes progress,
+                // and the established work-id-zero terminal shape may use v2.6.6's final
+                // outer-ack recovery. Otherwise fail closed.
+                if (RecoveryPolicy::ShouldReprobeZeroCandidate(after, signalCount)) {
+                    logs::warn(
+                        "[SiteARenderBreaker] ZERO-CANDIDATE REPROBE: validated signal "
+                        "0x{:x} advanced the chain but exposed no deep event while "
+                        "workid={} remains active; allowing up to {} ms for the next "
+                        "validated state (signals={}, episode={}).",
+                        deepHandle, currentWorkId, kZeroCandidateReprobeMs,
+                        signalCount, a_seq);
+
+                    bool foundDeepWait = false;
+                    for (std::uint32_t waited = 0;
+                         waited < kZeroCandidateReprobeMs &&
+                         g_running.load(std::memory_order_relaxed);
+                         waited += kVerifyStepMs)
+                    {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(kVerifyStepMs));
+
+                        if (!g_in_wait.load(std::memory_order_acquire) ||
+                            g_episode_seq.load(std::memory_order_relaxed) != a_seq)
+                        {
+                            logs::warn(
+                                "[SiteARenderBreaker] VERIFIED RELEASE DURING ZERO "
+                                "REPROBE after {} signal(s) (episode={}).",
+                                signalCount, a_seq);
+                            return true;
+                        }
+
+                        const auto probeProtocol = ReadSiteA(singleton);
+                        if (!probeProtocol.ok || probeProtocol.ack != a_ackEntry ||
+                            (probeProtocol.workid != currentWorkId &&
+                             !(currentWorkId != 0 && probeProtocol.workid == 0)))
+                        {
+                            logs::error(
+                                "[SiteARenderBreaker] ZERO-CANDIDATE REPROBE ABORTED: "
+                                "protocol changed unexpectedly (workid {}->{}, "
+                                "ack 0x{:x}->0x{:x}, episode={}).",
+                                currentWorkId,
+                                probeProtocol.ok ? probeProtocol.workid : 0xffffffffu,
+                                a_ackEntry, probeProtocol.ok ? probeProtocol.ack : 0,
+                                a_seq);
+                            return false;
+                        }
+
+                        ThreadSnap probe{};
+                        if (!CaptureThread(renderTid, probe) ||
+                            !IsInsideRenderTaskJoin(probe))
+                        {
+                            continue;
+                        }
+
+                        if (probe.rdi != 0 && probe.r14 == probe.rdi &&
+                            probe.rdi != probeProtocol.ack &&
+                            probe.rdi != probeProtocol.wake &&
+                            !SeenHandle(seen, signalCount, probe.rdi) &&
+                            QueryEventState(probe.rdi) == 0)
+                        {
+                            if (currentWorkId != probeProtocol.workid) {
+                                logs::warn(
+                                    "[SiteARenderBreaker] ZERO REPROBE HANDOFF: workid "
+                                    "{}->{} with new validated deep event 0x{:x}; "
+                                    "rebaselining (episode={}).",
+                                    currentWorkId, probeProtocol.workid, probe.rdi, a_seq);
+                                currentWorkId = probeProtocol.workid;
+                            } else {
+                                logs::warn(
+                                    "[SiteARenderBreaker] ZERO REPROBE PROGRESS: new "
+                                    "validated deep event 0x{:x} appeared with workid={} "
+                                    "(episode={}).",
+                                    probe.rdi, currentWorkId, a_seq);
+                            }
+                            lastProgressMs = NowMs();
+                            foundDeepWait = true;
+                            if (g_diag) {
+                                LogHandleReferences(
+                                    "ZERO-REPROBE-NEXT-CANDIDATE", probe.rdi, renderTid);
+                            }
+                            break;
+                        }
+                    }
+
+                    if (foundDeepWait) {
+                        continue;
+                    }
+
+                    const auto finalProtocol = ReadSiteA(singleton);
+                    ThreadSnap finalSnap{};
+                    const bool terminalAfterReprobe =
+                        finalProtocol.ok &&
+                        currentWorkId != 0 &&
+                        finalProtocol.workid == 0 &&
+                        finalProtocol.ack == a_ackEntry &&
+                        QueryEventState(a_ackEntry) == 0 &&
+                        CaptureThread(renderTid, finalSnap) &&
+                        IsInsideRenderTaskJoin(finalSnap) &&
+                        finalSnap.rdi == 0;
+
+                    if (terminalAfterReprobe) {
+                        logs::warn(
+                            "[SiteARenderBreaker] ZERO REPROBE TERMINAL HANDOFF: "
+                            "workid reached 0 with no remaining deep event; signaling "
+                            "the unchanged unsignaled outer ack 0x{:x} using the "
+                            "v2.6.6 terminal rule (episode={}).",
+                            a_ackEntry, a_seq);
+                        if (!::SetEvent(reinterpret_cast<HANDLE>(a_ackEntry))) {
+                            logs::error(
+                                "[SiteARenderBreaker] ZERO REPROBE TERMINAL ACK FAILED: "
+                                "SetEvent(0x{:x}) returned false (GetLastError={}, "
+                                "episode={}).",
+                                a_ackEntry, ::GetLastError(), a_seq);
+                            return false;
+                        }
+                        return true;
+                    }
+
+                    logs::error(
+                        "[SiteARenderBreaker] ZERO-CANDIDATE REPROBE EXHAUSTED: no "
+                        "natural unwind, no new validated deep event, and no terminal "
+                        "workid-zero handoff appeared within {} ms; failing closed "
+                        "(signals={}, workid={}, episode={}).",
+                        kZeroCandidateReprobeMs, signalCount, currentWorkId, a_seq);
+                    return false;
+                }
+
                 const bool nextSeen = SeenHandle(
                     seen, signalCount, after.deep_handle);
 
@@ -600,6 +736,7 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
                         deepHandle, currentWorkId, after.deep_handle,
                         a_ackEntry, a_seq);
                     currentWorkId = 0;
+                    lastProgressMs = NowMs();
                     if (g_diag) {
                         LogHandleReferences(
                             "HANDOFF-NEXT-CANDIDATE",
@@ -625,6 +762,7 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
                     return false;
                 }
 
+                lastProgressMs = NowMs();
                 logs::warn(
                     "[SiteARenderBreaker] PROGRESS VERIFIED: signal 0x{:x} moved "
                     "render join to new unsignaled candidate 0x{:x}; protocol is "
@@ -638,10 +776,12 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
 
             logs::error(
                 "[SiteARenderBreaker] DEEP RECOVERY STOPPED AT SAFETY BUDGET: "
-                "signals={} max_signals={} elapsed={} ms max_ms={} while episode "
-                "{} remained active. Refusing further forced completions.",
+                "signals={} max_signals={} elapsed={} ms max_ms={} no_progress={} "
+                "ms max_no_progress={} while episode {} remained active. Refusing "
+                "further forced completions.",
                 signalCount, kMaxDeepSignals, NowMs() - recoveryStart,
-                kMaxDeepRecoveryMs, a_seq);
+                kMaxDeepRecoveryMs, NowMs() - lastProgressMs,
+                kMaxNoProgressMs, a_seq);
             return false;
         }
 
@@ -824,7 +964,7 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
         g_watchdog.detach();
 
         logs::info(
-            "[SiteARenderBreaker] armed v2.6.4. id34557 @0x{:x} (+0x{:x}), "
+            "[SiteARenderBreaker] armed v2.6.7. id34557 @0x{:x} (+0x{:x}), "
             "mode={}, dwell_ms={}, poll_ms={}, recheck_ms={}, deep_budget={} "
             "signals/{} ms, diag={}.",
             a.renderTaskFn, a.renderTaskFnRVA,
