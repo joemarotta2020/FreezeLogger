@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -26,42 +26,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Apply v2.6.7 zero-candidate timing refinement
+      - name: Verify clean committed source
         run: |
-          $script = @'
-          from pathlib import Path
-          p = Path("src/SiteARenderBreaker_v264.cpp")
-          s = p.read_text(encoding="utf-8")
-
-          marker = "lastProgressMs = NowMs(); // zero-candidate transition is verified movement"
-          if marker not in s:
-              old = """                if (RecoveryPolicy::ShouldReprobeZeroCandidate(after, signalCount)) {\n                    logs::warn(\n"""
-              new = """                if (RecoveryPolicy::ShouldReprobeZeroCandidate(after, signalCount)) {\n                    lastProgressMs = NowMs(); // zero-candidate transition is verified movement\n                    logs::warn(\n"""
-              assert s.count(old) == 1, "zero-candidate progress reset anchor mismatch"
-              s = s.replace(old, new, 1)
-
-              old = """                    for (std::uint32_t waited = 0;\n                         waited < kZeroCandidateReprobeMs &&\n                         g_running.load(std::memory_order_relaxed);\n"""
-              new = """                    for (std::uint32_t waited = 0;\n                         waited < kZeroCandidateReprobeMs &&\n                         NowMs() - recoveryStart < kMaxDeepRecoveryMs &&\n                         g_running.load(std::memory_order_relaxed);\n"""
-              assert s.count(old) == 1, "zero-candidate absolute ceiling anchor mismatch"
-              s = s.replace(old, new, 1)
-              p.write_text(s, encoding="utf-8")
-          '@
-          $script | Set-Content -Path "$env:RUNNER_TEMP\refine_v267.py" -Encoding utf8
-          python "$env:RUNNER_TEMP\refine_v267.py"
           git diff --check
-          git diff -- src/SiteARenderBreaker_v264.cpp
-
-      - name: Persist refinement
-        run: |
-          if (git status --porcelain -- src/SiteARenderBreaker_v264.cpp) {
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add src/SiteARenderBreaker_v264.cpp
-            git commit -m "Refine v2.6.7 zero-candidate progress timing"
-            git push origin HEAD:sitea-v267-progress-window
-          } else {
-            echo "v2.6.7 timing refinement already committed"
-          }
+          if (git status --porcelain) { throw "Checkout is not clean" }
+          git log -1 --oneline
 
       - name: Configure environment
         run: |
