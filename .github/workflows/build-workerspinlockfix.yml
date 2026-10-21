@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -26,11 +26,99 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify clean committed source
+      - name: Apply v2.6.7 progress-window recovery patch
         run: |
+          $script = @'
+          from pathlib import Path
+
+          p = Path("src/SiteARenderBreaker_v264.cpp")
+          s = p.read_text(encoding="utf-8")
+          already = "kMaxDeepRecoveryMs = 15000" in s
+
+          if not already:
+              old = """        constexpr std::uint32_t kMaxDeepSignals = 12;\n        constexpr std::uint64_t kMaxDeepRecoveryMs = 6000;\n        constexpr std::uint32_t kVerifyMs = 500;\n"""
+              new = """        constexpr std::uint32_t kMaxDeepSignals = 12;\n        constexpr std::uint64_t kMaxDeepRecoveryMs = 15000;\n        constexpr std::uint64_t kMaxNoProgressMs = 2500;\n        constexpr std::uint32_t kZeroCandidateReprobeMs = 2500;\n        constexpr std::uint32_t kVerifyMs = 500;\n"""
+              assert s.count(old) == 1, "budget constant anchor mismatch"
+              s = s.replace(old, new, 1)
+
+              old = """            const auto recoveryStart = NowMs();\n            std::array<std::uintptr_t, kMaxDeepSignals> seen{};\n"""
+              new = """            const auto recoveryStart = NowMs();\n            auto lastProgressMs = recoveryStart;\n            std::array<std::uintptr_t, kMaxDeepSignals> seen{};\n"""
+              assert s.count(old) == 1, "recovery start anchor mismatch"
+              s = s.replace(old, new, 1)
+
+              old = """            while (RecoveryPolicy::WithinBudget(\n                signalCount, NowMs() - recoveryStart,\n                kMaxDeepSignals, kMaxDeepRecoveryMs))\n"""
+              new = """            while (RecoveryPolicy::WithinProgressBudget(\n                signalCount, NowMs() - recoveryStart,\n                NowMs() - lastProgressMs,\n                kMaxDeepSignals, kMaxDeepRecoveryMs, kMaxNoProgressMs))\n"""
+              assert s.count(old) == 1, "while budget anchor mismatch"
+              s = s.replace(old, new, 1)
+
+              old = """                    if (newDeepWait) {\n                        logs::warn(\n                            \"[SiteARenderBreaker] TERMINAL VERIFY: a new validated \"\n                            \"deep wait appeared; returning to normal progress-gated \"\n                            \"recovery (episode={}).\", a_seq);\n                        continue;\n                    }\n"""
+              new = """                    if (newDeepWait) {\n                        lastProgressMs = NowMs();\n                        logs::warn(\n                            \"[SiteARenderBreaker] TERMINAL VERIFY: a new validated \"\n                            \"deep wait appeared; returning to normal progress-gated \"\n                            \"recovery (episode={}).\", a_seq);\n                        continue;\n                    }\n"""
+              assert s.count(old) == 1, "terminal progress anchor mismatch"
+              s = s.replace(old, new, 1)
+
+              anchor = """                const bool nextSeen = SeenHandle(\n                    seen, signalCount, after.deep_handle);\n"""
+              insert = """                // v2.6.7: the 2026-10-21 field capture advanced through nine\n                // independently validated deep waits and then briefly exposed RDI=0\n                // while work-id was still nonzero. That is not permission to signal\n                // anything. Re-probe the same join for the full inactivity budget: a\n                // natural unwind succeeds, a new validated deep event refreshes progress,\n                // and the established work-id-zero terminal shape may use v2.6.6's final\n                // outer-ack recovery. Otherwise fail closed.\n                if (RecoveryPolicy::ShouldReprobeZeroCandidate(after, signalCount)) {\n                    logs::warn(\n                        \"[SiteARenderBreaker] ZERO-CANDIDATE REPROBE: validated signal \"\n                        \"0x{:x} advanced the chain but exposed no deep event while \"\n                        \"workid={} remains active; allowing up to {} ms for the next \"\n                        \"validated state (signals={}, episode={}).\",\n                        deepHandle, currentWorkId, kZeroCandidateReprobeMs,\n                        signalCount, a_seq);\n\n                    bool foundDeepWait = false;\n                    for (std::uint32_t waited = 0;\n                         waited < kZeroCandidateReprobeMs &&\n                         g_running.load(std::memory_order_relaxed);\n                         waited += kVerifyStepMs)\n                    {\n                        std::this_thread::sleep_for(\n                            std::chrono::milliseconds(kVerifyStepMs));\n\n                        if (!g_in_wait.load(std::memory_order_acquire) ||\n                            g_episode_seq.load(std::memory_order_relaxed) != a_seq)\n                        {\n                            logs::warn(\n                                \"[SiteARenderBreaker] VERIFIED RELEASE DURING ZERO \"\n                                \"REPROBE after {} signal(s) (episode={}).\",\n                                signalCount, a_seq);\n                            return true;\n                        }\n\n                        const auto probeProtocol = ReadSiteA(singleton);\n                        if (!probeProtocol.ok || probeProtocol.ack != a_ackEntry ||\n                            (probeProtocol.workid != currentWorkId &&\n                             !(currentWorkId != 0 && probeProtocol.workid == 0)))\n                        {\n                            logs::error(\n                                \"[SiteARenderBreaker] ZERO-CANDIDATE REPROBE ABORTED: \"\n                                \"protocol changed unexpectedly (workid {}->{}, \"\n                                \"ack 0x{:x}->0x{:x}, episode={}).\",\n                                currentWorkId,\n                                probeProtocol.ok ? probeProtocol.workid : 0xffffffffu,\n                                a_ackEntry, probeProtocol.ok ? probeProtocol.ack : 0,\n                                a_seq);\n                            return false;\n                        }\n\n                        ThreadSnap probe{};\n                        if (!CaptureThread(renderTid, probe) ||\n                            !IsInsideRenderTaskJoin(probe))\n                        {\n                            continue;\n                        }\n\n                        if (probe.rdi != 0 && probe.r14 == probe.rdi &&\n                            probe.rdi != probeProtocol.ack &&\n                            probe.rdi != probeProtocol.wake &&\n                            !SeenHandle(seen, signalCount, probe.rdi) &&\n                            QueryEventState(probe.rdi) == 0)\n                        {\n                            if (currentWorkId != probeProtocol.workid) {\n                                logs::warn(\n                                    \"[SiteARenderBreaker] ZERO REPROBE HANDOFF: workid \"\n                                    \"{}->{} with new validated deep event 0x{:x}; \"\n                                    \"rebaselining (episode={}).\",\n                                    currentWorkId, probeProtocol.workid, probe.rdi, a_seq);\n                                currentWorkId = probeProtocol.workid;\n                            } else {\n                                logs::warn(\n                                    \"[SiteARenderBreaker] ZERO REPROBE PROGRESS: new \"\n                                    \"validated deep event 0x{:x} appeared with workid={} \"\n                                    \"(episode={}).\",\n                                    probe.rdi, currentWorkId, a_seq);\n                            }\n                            lastProgressMs = NowMs();\n                            foundDeepWait = true;\n                            if (g_diag) {\n                                LogHandleReferences(\n                                    \"ZERO-REPROBE-NEXT-CANDIDATE\", probe.rdi, renderTid);\n                            }\n                            break;\n                        }\n                    }\n\n                    if (foundDeepWait) {\n                        continue;\n                    }\n\n                    const auto finalProtocol = ReadSiteA(singleton);\n                    ThreadSnap finalSnap{};\n                    const bool terminalAfterReprobe =\n                        finalProtocol.ok &&\n                        currentWorkId != 0 &&\n                        finalProtocol.workid == 0 &&\n                        finalProtocol.ack == a_ackEntry &&\n                        QueryEventState(a_ackEntry) == 0 &&\n                        CaptureThread(renderTid, finalSnap) &&\n                        IsInsideRenderTaskJoin(finalSnap) &&\n                        finalSnap.rdi == 0;\n\n                    if (terminalAfterReprobe) {\n                        logs::warn(\n                            \"[SiteARenderBreaker] ZERO REPROBE TERMINAL HANDOFF: \"\n                            \"workid reached 0 with no remaining deep event; signaling \"\n                            \"the unchanged unsignaled outer ack 0x{:x} using the \"\n                            \"v2.6.6 terminal rule (episode={}).\",\n                            a_ackEntry, a_seq);\n                        if (!::SetEvent(reinterpret_cast<HANDLE>(a_ackEntry))) {\n                            logs::error(\n                                \"[SiteARenderBreaker] ZERO REPROBE TERMINAL ACK FAILED: \"\n                                \"SetEvent(0x{:x}) returned false (GetLastError={}, \"\n                                \"episode={}).\",\n                                a_ackEntry, ::GetLastError(), a_seq);\n                            return false;\n                        }\n                        return true;\n                    }\n\n                    logs::error(\n                        \"[SiteARenderBreaker] ZERO-CANDIDATE REPROBE EXHAUSTED: no \"\n                        \"natural unwind, no new validated deep event, and no terminal \"\n                        \"workid-zero handoff appeared within {} ms; failing closed \"\n                        \"(signals={}, workid={}, episode={}).\",\n                        kZeroCandidateReprobeMs, signalCount, currentWorkId, a_seq);\n                    return false;\n                }\n\n"""
+              assert s.count(anchor) == 1, "zero-candidate insertion anchor mismatch"
+              s = s.replace(anchor, insert + anchor, 1)
+
+              old = """                    currentWorkId = 0;\n                    if (g_diag) {\n"""
+              new = """                    currentWorkId = 0;\n                    lastProgressMs = NowMs();\n                    if (g_diag) {\n"""
+              assert s.count(old) == 1, "handoff progress anchor mismatch"
+              s = s.replace(old, new, 1)
+
+              old = """                logs::warn(\n                    \"[SiteARenderBreaker] PROGRESS VERIFIED: signal 0x{:x} moved \"\n"""
+              new = """                lastProgressMs = NowMs();\n                logs::warn(\n                    \"[SiteARenderBreaker] PROGRESS VERIFIED: signal 0x{:x} moved \"\n"""
+              assert s.count(old) == 1, "normal progress anchor mismatch"
+              s = s.replace(old, new, 1)
+
+              old = """            logs::error(\n                \"[SiteARenderBreaker] DEEP RECOVERY STOPPED AT SAFETY BUDGET: \"\n                \"signals={} max_signals={} elapsed={} ms max_ms={} while episode \"\n                \"{} remained active. Refusing further forced completions.\",\n                signalCount, kMaxDeepSignals, NowMs() - recoveryStart,\n                kMaxDeepRecoveryMs, a_seq);\n"""
+              new = """            logs::error(\n                \"[SiteARenderBreaker] DEEP RECOVERY STOPPED AT SAFETY BUDGET: \"\n                \"signals={} max_signals={} elapsed={} ms max_ms={} no_progress={} \"\n                \"ms max_no_progress={} while episode {} remained active. Refusing \"\n                \"further forced completions.\",\n                signalCount, kMaxDeepSignals, NowMs() - recoveryStart,\n                kMaxDeepRecoveryMs, NowMs() - lastProgressMs,\n                kMaxNoProgressMs, a_seq);\n"""
+              assert s.count(old) == 1, "budget log anchor mismatch"
+              s = s.replace(old, new, 1)
+
+              assert s.count('"[SiteARenderBreaker] armed v2.6.4.') == 1
+              s = s.replace('"[SiteARenderBreaker] armed v2.6.4.',
+                            '"[SiteARenderBreaker] armed v2.6.7.', 1)
+
+              p.write_text(s, encoding="utf-8")
+
+          cm = Path("CMakeLists.txt")
+          c = cm.read_text(encoding="utf-8")
+          if "VERSION       2.6.6" in c:
+              c = c.replace("VERSION       2.6.6", "VERSION       2.6.7", 1)
+              old_desc = "v2.6.6 retains the v2.6.5 handoff gate and adds field-validated terminal outer-ack recovery when a verified deep chain exhausts at work-id zero without naturally completing the Site-A episode."
+              new_desc = "v2.6.7 extends verified render-side recovery to a 15-second absolute window with a 2.5-second inactivity gate and safely re-probes transient zero deep candidates without blind signaling."
+              assert old_desc in c, "CMake description anchor mismatch"
+              c = c.replace(old_desc, new_desc, 1)
+              cm.write_text(c, encoding="utf-8")
+          else:
+              assert "VERSION       2.6.7" in c, "unexpected CMake version"
+
+          toml = Path("dist/WorkerSpinLockFix.toml")
+          t = toml.read_text(encoding="utf-8")
+          if "WorkerSpinLockFix v2.6.6" in t:
+              t = t.replace("WorkerSpinLockFix v2.6.6", "WorkerSpinLockFix v2.6.7", 1)
+          marker = "# v2.6.7: render deep recovery"
+          if marker not in t:
+              t += "\n# v2.6.7: render deep recovery now has a 15s absolute ceiling, a 2.5s\n# no-progress ceiling refreshed by verified forward progress, and a fail-closed\n# 2.5s re-probe when a validated chain temporarily exposes no deep event.\n"
+          toml.write_text(t, encoding="utf-8")
+          '@
+          $script | Set-Content -Path "$env:RUNNER_TEMP\apply_v267.py" -Encoding utf8
+          python "$env:RUNNER_TEMP\apply_v267.py"
           git diff --check
-          if (git status --porcelain) { throw "Checkout is not clean" }
-          git log -1 --oneline
+          git diff -- src/SiteARenderBreaker_v264.cpp CMakeLists.txt dist/WorkerSpinLockFix.toml
+
+      - name: Persist v2.6.7 source patch
+        run: |
+          if (git status --porcelain -- src/SiteARenderBreaker_v264.cpp CMakeLists.txt dist/WorkerSpinLockFix.toml) {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/SiteARenderBreaker_v264.cpp CMakeLists.txt dist/WorkerSpinLockFix.toml
+            git commit -m "WorkerSpinLockFix v2.6.7 progress-window recovery"
+            git push origin HEAD:sitea-v267-progress-window
+          } else {
+            echo "v2.6.7 source patch already committed"
+          }
 
       - name: Configure environment
         run: |
@@ -61,6 +149,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WorkerSpinLockFix-sitea-v267
+          name: WorkerSpinLockFix-v2.6.7
           path: artifact/*
           if-no-files-found: error
