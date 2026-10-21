@@ -73,6 +73,25 @@ namespace WorkerSpinLockFix::RecoveryPolicy {
         static_assert(WithinBudget(4, 2000, 12, 6000));
         static_assert(!WithinBudget(12, 2000, 12, 6000));
         static_assert(!WithinBudget(4, 6000, 12, 6000));
+
+        // v2.6.7: the hard-freeze rescue gets a 15 s absolute ceiling, while
+        // verified forward progress refreshes a shorter inactivity window.
+        static_assert(WithinProgressBudget(9, 6281, 400, 12, 15000, 2500));
+        static_assert(!WithinProgressBudget(12, 6281, 400, 12, 15000, 2500));
+        static_assert(!WithinProgressBudget(9, 15000, 400, 12, 15000, 2500));
+        static_assert(!WithinProgressBudget(9, 7000, 2500, 12, 15000, 2500));
+
+        // A newly observed zero deep handle after verified progress is not
+        // itself a completion when work-id is still nonzero. It must be
+        // re-probed briefly for either unwind or a new validated deep event.
+        static_assert(ShouldReprobeZeroCandidate(
+            { true, 7, 1, 0x100, 0x000 }, 9));
+        static_assert(!ShouldReprobeZeroCandidate(
+            { true, 7, 0, 0x100, 0x000 }, 9));
+        static_assert(!ShouldReprobeZeroCandidate(
+            { true, 7, 1, 0x100, 0x222 }, 9));
+        static_assert(!ShouldReprobeZeroCandidate(
+            { true, 7, 1, 0x100, 0x000 }, 0));
     }
 
 }
