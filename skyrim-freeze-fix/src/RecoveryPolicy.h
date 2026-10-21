@@ -50,6 +50,29 @@ namespace WorkerSpinLockFix::RecoveryPolicy {
         return signals_already_sent < max_signals && elapsed_ms < max_recovery_ms;
     }
 
+    constexpr bool WithinProgressBudget(
+        std::uint32_t signals_already_sent,
+        std::uint64_t elapsed_ms,
+        std::uint64_t no_progress_ms,
+        std::uint32_t max_signals,
+        std::uint64_t max_recovery_ms,
+        std::uint64_t max_no_progress_ms) noexcept
+    {
+        return signals_already_sent < max_signals &&
+               elapsed_ms < max_recovery_ms &&
+               no_progress_ms < max_no_progress_ms;
+    }
+
+    constexpr bool ShouldReprobeZeroCandidate(
+        const DeepProgress& after,
+        std::uint32_t signals_already_sent) noexcept
+    {
+        return signals_already_sent > 0 &&
+               after.in_wait &&
+               after.workid != 0 &&
+               after.deep_handle == 0;
+    }
+
     // Compile-time regression tests for the progress gate. These make the
     // safety contract part of every WorkerSpinLockFix build.
     namespace tests {
