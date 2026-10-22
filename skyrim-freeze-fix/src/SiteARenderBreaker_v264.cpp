@@ -16,11 +16,12 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
         constexpr std::uintptr_t kOffWorkId = 0x68;
 
         constexpr std::uint32_t kMaxDeepSignals = 12;
-        constexpr std::uint64_t kMaxDeepRecoveryMs = 6000;
+        constexpr std::uint64_t kMaxDeepRecoveryMs = 15000;
         constexpr std::uint32_t kVerifyMs = 500;
         constexpr std::uint32_t kVerifyStepMs = 25;
         constexpr std::uint32_t kUnwindGraceMs = 250;
         constexpr std::uint32_t kTerminalUnwindVerifyMs = 1000;
+        constexpr std::uint32_t kZeroCandidateProbeMs = 2000;
 
         SafetyHookInline g_hook{};
 
@@ -329,8 +330,66 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
                     return false;
                 }
 
-                const auto deepHandle = beforeSnap.rdi;
-                if (deepHandle == 0 || beforeSnap.r14 != deepHandle) {
+                auto deepHandle = beforeSnap.rdi;
+
+                // v2.6.7 field evidence: a verified signal can advance id 34557
+                // through a transient no-candidate state (RDI=0) before the next
+                // sub-task wait is published. Treat zero as a bounded re-probe
+                // state, not as an event to signal and not as immediate failure.
+                if (deepHandle == 0) {
+                    logs::warn(
+                        "[SiteARenderBreaker] ZERO-CANDIDATE REPROBE: render join "
+                        "has no current deep wait after verified progress; probing "
+                        "for up to {} ms before failing closed (episode={}).",
+                        kZeroCandidateProbeMs, a_seq);
+
+                    bool foundNewWait = false;
+                    for (std::uint32_t waited = 0;
+                         waited < kZeroCandidateProbeMs &&
+                         g_running.load(std::memory_order_relaxed);
+                         waited += kVerifyStepMs)
+                    {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(kVerifyStepMs));
+
+                        if (!g_in_wait.load(std::memory_order_acquire) ||
+                            g_episode_seq.load(std::memory_order_relaxed) != a_seq)
+                        {
+                            logs::warn(
+                                "[SiteARenderBreaker] VERIFIED RELEASE DURING "
+                                "ZERO-CANDIDATE REPROBE after {} signal(s) "
+                                "(episode={}).", signalCount, a_seq);
+                            return true;
+                        }
+
+                        ThreadSnap probe{};
+                        if (CaptureThread(renderTid, probe) &&
+                            IsInsideRenderTaskJoin(probe) &&
+                            probe.rdi != 0 && probe.r14 == probe.rdi)
+                        {
+                            beforeSnap = probe;
+                            deepHandle = probe.rdi;
+                            foundNewWait = true;
+                            logs::warn(
+                                "[SiteARenderBreaker] ZERO-CANDIDATE REPROBE "
+                                "VERIFIED: new deep wait 0x{:x} appeared; "
+                                "continuing normal safety validation "
+                                "(episode={}).", deepHandle, a_seq);
+                            break;
+                        }
+                    }
+
+                    if (!foundNewWait) {
+                        logs::error(
+                            "[SiteARenderBreaker] ZERO-CANDIDATE REPROBE "
+                            "EXHAUSTED: same episode remained active without a "
+                            "new validated deep wait for {} ms; failing closed "
+                            "(episode={}).", kZeroCandidateProbeMs, a_seq);
+                        return false;
+                    }
+                }
+
+                if (beforeSnap.r14 != deepHandle) {
                     logs::error(
                         "[SiteARenderBreaker] DEEP RECOVERY ABORTED: RDI/R14 do "
                         "not identify one stable wait event (RDI=0x{:x}, "
@@ -824,7 +883,7 @@ namespace WorkerSpinLockFix::SiteARenderBreaker {
         g_watchdog.detach();
 
         logs::info(
-            "[SiteARenderBreaker] armed v2.6.4. id34557 @0x{:x} (+0x{:x}), "
+            "[SiteARenderBreaker] armed v2.6.7. id34557 @0x{:x} (+0x{:x}), "
             "mode={}, dwell_ms={}, poll_ms={}, recheck_ms={}, deep_budget={} "
             "signals/{} ms, diag={}.",
             a.renderTaskFn, a.renderTaskFnRVA,

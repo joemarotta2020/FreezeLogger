@@ -73,6 +73,8 @@ namespace WorkerSpinLockFix::RecoveryPolicy {
         static_assert(WithinBudget(4, 2000, 12, 6000));
         static_assert(!WithinBudget(12, 2000, 12, 6000));
         static_assert(!WithinBudget(4, 6000, 12, 6000));
+        static_assert(WithinBudget(9, 6281, 12, 15000));
+        static_assert(!WithinBudget(9, 15000, 12, 15000));
     }
 
 }

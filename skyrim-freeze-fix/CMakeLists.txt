@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.26)
 
 project(WorkerSpinLockFix
-    VERSION       2.6.6
-    DESCRIPTION   "SKSE hard-freeze recovery for Skyrim SE/AE. v2.6.6 retains the v2.6.5 handoff gate and adds field-validated terminal outer-ack recovery when a verified deep chain exhausts at work-id zero without naturally completing the Site-A episode."
+    VERSION       2.6.7
+    DESCRIPTION   "SKSE hard-freeze recovery for Skyrim SE/AE. v2.6.7 retains v2.6.6 terminal recovery, extends verified deep recovery to 15 seconds, and boundedly re-probes transient zero deep-candidate states before failing closed."
     LANGUAGES     CXX
 )
 

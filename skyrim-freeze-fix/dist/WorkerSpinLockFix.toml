@@ -1,4 +1,4 @@
-# WorkerSpinLockFix v2.6.6 - field diagnostic/recovery profile
+# WorkerSpinLockFix v2.6.7 - field diagnostic/recovery profile
 # Read once at SKSEPlugin_Load; restart Skyrim after changing this file.
 
 [plugin]
@@ -63,3 +63,8 @@ diagnostic_logging = false
 # v2.6.6: after a verified bounded deep chain reaches work-id 0 with no remaining
 # deep event, revalidate the same id-34557 episode for 1s before signaling the
 # unchanged unsignaled outer worker-ack. Any protocol change still aborts.
+
+# v2.6.7: SiteARenderBreaker retains the 12-signal hard ceiling but allows up to
+# 15 seconds while every forced completion continues to produce verified forward
+# progress. A transient RDI=0 state gets a bounded 2-second re-probe; no zero
+# handle is ever signaled, and unchanged safety/protocol gates still fail closed.
